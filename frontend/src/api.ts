@@ -143,14 +143,18 @@ export function wsUrl(base: string, token: string): string {
 }
 
 export function novncIframeUrl(cfg: StoredConfig): string {
+  // Prefer the token-protected backend proxy: no separate VNC password needed.
+  if (cfg.backendUrl && cfg.agentToken) {
+    const t = encodeURIComponent(cfg.agentToken);
+    const wsPath = encodeURIComponent(`novnc/websockify?token=${cfg.agentToken}`);
+    return `${joinUrl(cfg.backendUrl, '/novnc/vnc.html')}?token=${t}&autoconnect=1&reconnect=1&resize=scale&path=${wsPath}`;
+  }
   if (cfg.vncUrl) {
     const raw = cfg.vncUrl.trim();
-    if (raw.includes('token=')) return raw;
     const sep = raw.includes('?') ? '&' : '?';
-    return `${raw}${sep}token=${encodeURIComponent(cfg.agentToken)}`;
+    return `${raw}${sep}autoconnect=1&resize=scale`;
   }
-  if (!cfg.backendUrl) return '';
-  return `${joinUrl(cfg.backendUrl, '/novnc/vnc.html')}?token=${encodeURIComponent(cfg.agentToken)}&autoconnect=1`;
+  return '';
 }
 
 export async function apiFetch<T = unknown>(

@@ -70,7 +70,9 @@ async def novnc_ws(websocket: WebSocket):
     if not tokens_match(token_from_ws(websocket)):
         await websocket.close(code=1008)
         return
-    await websocket.accept()
+    requested = [p.strip() for p in (websocket.headers.get("sec-websocket-protocol") or "").split(",") if p.strip()]
+    sub = "binary" if "binary" in requested else None
+    await websocket.accept(subprotocol=sub)
     try:
         import websockets
     except ImportError:
@@ -78,7 +80,7 @@ async def novnc_ws(websocket: WebSocket):
         return
     up_url = _ws_url("websockify")
     try:
-        async with websockets.connect(up_url, open_timeout=10, max_size=2**23) as upstream:
+        async with websockets.connect(up_url, open_timeout=10, max_size=2**23, subprotocols=["binary"] if sub else None) as upstream:
             async def client_to_up():
                 try:
                     while True:

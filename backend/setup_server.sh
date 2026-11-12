@@ -267,7 +267,7 @@ ExecStart=/bin/bash -c '\
   sleep 2; \
   DISPLAY=:99 icewm & \
   sleep 1; \
-  x11vnc -display :99 -localhost -forever -shared -rfbport 5900 -rfbauth ${VNC_PASS_FILE} -ncache 0 & \
+  x11vnc -display :99 -localhost -forever -shared -rfbport 5900 -nopw -ncache 0 & \
   /usr/share/novnc/utils/novnc_proxy --vnc 127.0.0.1:5900 --listen 127.0.0.1:6080'
 Restart=always
 RestartSec=5
@@ -379,7 +379,7 @@ if [[ "$HAS_SYSTEMD" -eq 1 ]]; then
   systemctl enable --now grokpc-desktop.service
   systemctl enable --now grokpc-agent.service
   if [[ "${GROKPC_NO_TUNNEL:-0}" != "1" ]]; then
-    systemctl enable --now grokpc-tunnel.service grokpc-tunnel-vnc.service
+    systemctl enable --now grokpc-tunnel.service; systemctl disable --now grokpc-tunnel-vnc.service 2>/dev/null || true  # VNC only via token-protected /novnc proxy
   fi
 else
   echo "No systemd: starting the stack with start_stack.sh (background processes)."
