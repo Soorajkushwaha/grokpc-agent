@@ -148,3 +148,186 @@ async def render_video(
         "audio_path": str(audio),
         "voice_engine": engine,
     }
+
+
+
+async def write_silent_audio(dest: Path, seconds: float = 4.0) -> None:
+    """Generate a short silent MP3 with ffmpeg so DRY_RUN / offline boxes still work."""
+    import shutil
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if not shutil.which("ffmpeg"):
+        # Minimal valid-ish MP3 header + silence is hard; write a wav instead.
+        import wave, struct
+        dest_wav = dest.with_suffix(".wav")
+        with wave.open(str(dest_wav), "w") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(16000)
+            w.writeframes(b"\x00\x00" * int(16000 * seconds))
+        if dest.suffix.lower() != ".wav":
+            dest.write_bytes(dest_wav.read_bytes())
+        return
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "lavfi", "-i", f"anullsrc=r=16000:cl=mono",
+        "-t", str(max(1.0, seconds)),
+        "-c:a", "libmp3lame", "-q:a", "9",
+        str(dest),
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    _out, err = await proc.communicate()
+    if proc.returncode != 0 or not dest.is_file():
+        raise RuntimeError(err.decode("utf-8", "replace")[-800:] or "ffmpeg silent audio failed")
+
+
+async def synthesize_voice_safe(script: str, lang: str, dest: Path, log: Optional[LogFn] = None) -> str:
+    """Phase 1 voiceover: Gemini TTS (opt-in) -> gTTS -> silent ffmpeg (DRY_RUN / offline)."""
+    from config import DRY_RUN
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if DRY_RUN:
+        await _emit(log, "action", "Voiceover", "DRY_RUN silent audio (no gTTS network call)")
+        await write_silent_audio(dest, seconds=max(3.0, min(12.0, len(script or "") / 12)))
+        return "dry_run"
+    try:
+        return await synthesize_voice(script, lang, dest, log=log)
+    except Exception as exc:
+        logger.warning("Voiceover failed (%s); writing silent audio", exc)
+        await _emit(log, "system", "TTS fallback", f"{exc}; silent audio so edit can continue")
+        await write_silent_audio(dest, seconds=6.0)
+        return "silent"
+
+
+def _escape_drawtext(text: str) -> str:
+    # ffmpeg drawtext is picky: escape \\, :, ', %
+    cleaned = (text or "").replace("\\", " ").replace(":", " ").replace("'", "").replace("%", " ")
+    cleaned = cleaned.replace("\n", " ")[:80]
+    return cleaned
+
+
+async def assemble_video(
+    *,
+    title: str,
+    audio_path: Optional[Path] = None,
+    images: Optional[list[Path]] = None,
+    clips: Optional[list[Path]] = None,
+    duration_seconds: int = 20,
+    aspect: str = "16:9",
+    log: Optional[LogFn] = None,
+    dest: Optional[Path] = None,
+) -> dict[str, Any]:
+    """FFmpeg auto-edit fallback (Phase 1 default editor).
+
+    - If clips are given, concat them and mux the voiceover.
+    - Else if images are given, make a simple slideshow + voiceover.
+    - Else a color title card + voiceover (same idea as render_video).
+    """
+    import shutil
+    import time as _time
+
+    if not shutil.which("ffmpeg"):
+        raise RuntimeError("ffmpeg is not installed")
+
+    out = dest
+    if out is None:
+        stamp = int(_time.time())
+        safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in title)[:40] or "video"
+        out = output_dir() / f"{safe}_{stamp}.mp4"
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    if aspect == "9:16":
+        size = "720x1280"
+    elif aspect == "1:1":
+        size = "720x720"
+    else:
+        size = "1280x720"
+
+    await _emit(log, "terminal", "FFmpeg", f"Assembling {out.name} ({size})")
+
+    duration = max(int(duration_seconds), 8)
+    audio_args: list[str] = []
+    if audio_path and Path(audio_path).is_file():
+        audio_args = ["-i", str(audio_path)]
+
+    async def _run(cmd: list[str]) -> tuple[int, str]:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        _o, err = await proc.communicate()
+        return proc.returncode, err.decode("utf-8", "replace")[-1500:]
+
+    clips = [Path(c) for c in (clips or []) if Path(c).is_file()]
+    images = [Path(i) for i in (images or []) if Path(i).is_file()]
+
+    if clips:
+        lst = out.with_suffix(".concat.txt")
+        lst.write_text("".join(f"file '{c}'\n" for c in clips), encoding="utf-8")
+        cmd = [
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(lst),
+            *audio_args,
+            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "128k",
+            "-shortest", "-movflags", "+faststart",
+            str(out),
+        ]
+        code, err = await _run(cmd)
+        if code == 0 and out.is_file():
+            await _emit(log, "system", "Video ready", f"Saved to {out}")
+            record_usage(task_type="video", status="ok", details=str(out), provider="ffmpeg", model="concat")
+            return {"status": "success", "video_path": str(out), "engine": "ffmpeg-concat"}
+
+    if images:
+        # One image held for `duration / n` each, scaled to size.
+        per = max(2.0, duration / max(len(images), 1))
+        # Use the first image as a simple Ken-Burns-less still sequence via lavfi is complex;
+        # a reliable path: loop first image, or concat stills.
+        first = images[0]
+        cmd = [
+            "ffmpeg", "-y",
+            "-loop", "1", "-t", str(duration), "-i", str(first),
+            *audio_args,
+            "-vf", f"scale={size}:force_original_aspect_ratio=decrease,pad={size}:(ow-iw)/2:(oh-ih)/2",
+            "-c:v", "libx264", "-tune", "stillimage", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "128k",
+            "-shortest", "-movflags", "+faststart",
+            str(out),
+        ]
+        code, err = await _run(cmd)
+        if code == 0 and out.is_file():
+            await _emit(log, "system", "Video ready", f"Saved to {out}")
+            record_usage(task_type="video", status="ok", details=str(out), provider="ffmpeg", model="slideshow")
+            return {"status": "success", "video_path": str(out), "engine": "ffmpeg-image"}
+
+    label = _escape_drawtext(title)
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "lavfi", "-i", f"color=c=0x0a101f:s={size}:d={duration}",
+        *audio_args,
+        "-filter_complex",
+        f"drawtext=text='{label}':fontcolor=white:fontsize=36:x=(w-text_w)/2:y=(h-text_h)/2",
+        "-c:v", "libx264", "-tune", "stillimage", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k",
+        "-shortest", "-movflags", "+faststart",
+        str(out),
+    ]
+    code, err = await _run(cmd)
+    if code != 0:
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "lavfi", "-i", f"color=c=0x0a101f:s={size}:d={duration}",
+            *audio_args,
+            "-c:v", "libx264", "-tune", "stillimage", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "128k",
+            "-shortest", "-movflags", "+faststart",
+            str(out),
+        ]
+        code, err = await _run(cmd)
+        if code != 0:
+            raise RuntimeError(err or "ffmpeg title-card failed")
+
+    await _emit(log, "system", "Video ready", f"Saved to {out}")
+    record_usage(task_type="video", status="ok", details=str(out), provider="ffmpeg", model="titlecard")
+    return {"status": "success", "video_path": str(out), "engine": "ffmpeg-titlecard"}

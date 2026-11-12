@@ -8,6 +8,9 @@ Settings me ab **Laptop / Tablet / VPS** switch hai — tablet ka URL+token alag
 
 Private repo hai, isliye `curl` se raw file **nahi** aaegi. ZIP download karo.
 
+
+> **Phase 2:** Abhi rollout **laptop pehle** hai. Tablet baad me. Is setup se planning / awaz / FFmpeg chal sakta hai, lekin **CapCut-on-Android automate nahi** hota.
+
 ---
 
 ## Kyun Termux native, Ubuntu proot nahi?

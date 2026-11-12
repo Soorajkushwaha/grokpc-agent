@@ -213,7 +213,7 @@ else
   pip install -r "$APP_DIR/requirements.txt"
 fi
 python -m playwright install-deps chromium || true
-python -m playwright install chromium
+sudo -u "$INSTALL_USER" -H "$APP_DIR/.venv/bin/python" -m playwright install chromium
 
 GEN_TOKEN=""
 GEN_VNCPW=""
@@ -448,10 +448,15 @@ echo "================================================================"
   {
     name: "main.py",
     path: "/app/agent/main.py",
-    description: "FastAPI + WebSocket server with bearer auth, approvals, health, budget, video.",
+    description: "FastAPI + WebSocket: jobs/channels API, vision /api/task, health, budget. Messaging removed.",
     language: "python",
     category: "python",
-    content: `"""GrokPC FastAPI server — authenticated REST + WebSocket for the mobile control center."""
+    content: `"""GrokPC FastAPI server — video-production jobs + the existing vision agent.
+
+Phase 1 adds jobs/channels/pipeline APIs. The live /api/task vision loop (the
+one that already opened YouTube) is unchanged. Messaging endpoints are gone.
+Phase 2 features are flag-gated and default OFF.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -463,25 +468,51 @@ from contextlib import asynccontextmanager
 from typing import Any, Optional
 
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from agent_core import BrowserAgentCore
 from auth import cors_origins, require_auth, token_from_ws, tokens_match
-from config import AGENT_TOKEN, DRY_RUN, HOST, PORT, require_token
-from db import budget_summary, init_db, record_usage
+from channels import add_channel, delete_channel, get_channel, list_channels, update_channel
+from config import (
+    ANDROID,
+    DRY_RUN,
+    FEATURE_AUTOPILOT,
+    FEATURE_YOUTUBE_UPLOAD,
+    HOST,
+    PORT,
+    feature_flags,
+    pipeline_steps,
+    require_token,
+)
+from db import budget_summary, init_db, today_stats
+from desktop_client import helper_status
+from jobs import (
+    append_log,
+    cancel_job,
+    create_job,
+    get_job,
+    list_jobs,
+    list_logs,
+    pause_job,
+    resume_job,
+    running_job,
+    update_job,
+)
 from novnc_proxy import router as novnc_router
-from telegram_bridge import TelegramBridge
+from pipeline import PipelineRunner
+from runtime_settings import load_settings, save_settings
+from style_profile import load_profile, save_profile
 from video_pipeline import render_video
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("grokpc.main")
 
 clients: list[WebSocket] = []
-pending: dict[str, dict[str, Any]] = {}
 agent: Optional[BrowserAgentCore] = None
-telegram: Optional[TelegramBridge] = None
+runner: Optional[PipelineRunner] = None
 _main_loop: Optional[asyncio.AbstractEventLoop] = None
 
 
@@ -502,78 +533,17 @@ async def broadcast(payload: dict[str, Any]) -> None:
             clients.remove(ws)
 
 
-async def resolve_approval(approval_id: str, approved: bool, modified: Optional[str] = None) -> dict[str, Any]:
-    item = pending.get(approval_id)
-    if not item:
-        raise HTTPException(status_code=404, detail="Unknown or expired approval")
-    if item.get("resolved"):
-        return {"status": "already_resolved", "approval_id": approval_id}
-    item["resolved"] = True
-    item["approved"] = approved
-    if approved and modified is not None:
-        if item["type"] == "whatsapp":
-            item["message"] = modified
-        elif item["type"] == "gmail":
-            item["body"] = modified
-    await broadcast(
-        {
-            "type": "approval",
-            "title": "Approved" if approved else "Rejected",
-            "message": f"{item['type']} {approval_id} {'approved' if approved else 'rejected'}",
-            "approvalId": approval_id,
-            "approved": approved,
-        }
-    )
-    if not approved:
-        pending.pop(approval_id, None)
-        record_usage(task_type=item["type"], status="rejected", details=approval_id)
-        return {"status": "rejected", "approval_id": approval_id}
+def _port_open(host: str, port: int) -> bool:
+    import socket
 
-    if item["type"] == "whatsapp":
-        result = await agent.run_whatsapp_send(item["contact"], item["message"], item.get("attachment_path") or None)
-    elif item["type"] == "gmail":
-        result = await agent.run_gmail_send(item["recipient"], item.get("subject") or "", item.get("body") or "")
-    else:
-        result = {"status": "error", "message": f"Unknown type {item['type']}"}
-    pending.pop(approval_id, None)
-    record_usage(task_type=item["type"], status=result.get("status") or "ok", details=str(result)[:500])
-    await broadcast({"type": "action", "title": "Approved task finished", "message": json.dumps(result, default=str)[:500]})
-    return {"status": "executed", "approval_id": approval_id, "result": result}
+    try:
+        with socket.create_connection((host, port), timeout=0.3):
+            return True
+    except OSError:
+        return False
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global agent, telegram, _main_loop
-    require_token()
-    init_db()
-    _main_loop = asyncio.get_running_loop()
-    agent = BrowserAgentCore(log_callback=broadcast)
-    telegram = TelegramBridge(on_decision=resolve_approval)
-    await telegram.start()
-    yield
-    await telegram.stop()
-    if agent:
-        await agent.close()
-
-
-app = FastAPI(title="GrokPC Agent", lifespan=lifespan)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=cors_origins(),
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"],
-)
-app.include_router(novnc_router)
-
-
-# ---------------------------------------------------------------------------
-# REST
-# ---------------------------------------------------------------------------
-
-
-@app.get("/api/health")
-async def get_health(_auth: str = Depends(require_auth)):
+def _health_payload() -> dict[str, Any]:
     import os
     import shutil
 
@@ -592,10 +562,9 @@ async def get_health(_auth: str = Depends(require_auth)):
         pass
     try:
         with open("/proc/loadavg") as f:
-            cpu = round(float(f.read().split()[0]) * 25, 1)  # rough % of 4 cores
+            cpu = round(float(f.read().split()[0]) * 25, 1)
     except Exception:
         pass
-
     gdrive = "/mnt/gdrive"
     return {
         "connected": True,
@@ -614,157 +583,404 @@ async def get_health(_auth: str = Depends(require_auth)):
         "fastapiPortActive": True,
         "dryRun": DRY_RUN,
         "lastPing": int(time.time() * 1000),
+        "android": ANDROID,
+        "agentBusy": bool(agent and agent.is_busy),
     }
 
 
-def _port_open(host: str, port: int) -> bool:
-    import socket
+async def _status_payload() -> dict[str, Any]:
+    health = _health_payload()
+    stats = today_stats()
+    settings = load_settings()
+    current = running_job()
+    if current is None and runner and runner.current_job_id:
+        current = get_job(runner.current_job_id)
+    helper = await helper_status()
+    return {
+        "ok": True,
+        "phase": 1,
+        "features": feature_flags(),
+        "steps": pipeline_steps(),
+        "dryRun": DRY_RUN,
+        "busy": bool(agent and agent.is_busy) or bool(current),
+        "agentBusy": bool(agent and agent.is_busy),
+        "currentJob": (
+            {
+                "id": current["id"],
+                "topic": current["topic"],
+                "status": current["status"],
+                "current_step": current["current_step"],
+                "channel_id": current["channel_id"],
+            }
+            if current
+            else None
+        ),
+        "helper": helper,
+        "autopilot": {
+            "feature": FEATURE_AUTOPILOT,
+            "enabled": bool(settings.get("autopilot_enabled")) and FEATURE_AUTOPILOT,
+            "quiet_hours": settings.get("quiet_hours"),
+            "idle_seconds": settings.get("idle_seconds"),
+            "daily_video_cap": settings.get("daily_video_cap"),
+            "daily_spend_cap_inr": settings.get("daily_spend_cap_inr"),
+        },
+        "today": {
+            "videos": stats["videosToday"],
+            "spendInr": stats["spendInrToday"],
+            "videoCap": settings.get("daily_video_cap"),
+            "spendCapInr": settings.get("daily_spend_cap_inr"),
+        },
+        "channels": len(list_channels()),
+        "health": {
+            "hostname": health["hostname"],
+            "ramUsedGb": health["ramUsedGb"],
+            "ramTotalGb": health["ramTotalGb"],
+            "novncPortActive": health["novncPortActive"],
+        },
+    }
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global agent, runner, _main_loop
+    require_token()
+    init_db()
+    from channels import ensure_defaults
+
+    ensure_defaults()
+    load_profile()
+    _main_loop = asyncio.get_running_loop()
+    agent = BrowserAgentCore(log_callback=broadcast)
+    runner = PipelineRunner(agent=agent, broadcast=broadcast)
+    await runner.start()
+    # Phase 2 autopilot loop is intentionally not started unless the flag is on.
+    if FEATURE_AUTOPILOT:
+        logger.info("FEATURE_AUTOPILOT=1 — scaffold is present; enable the toggle in Settings to use it")
+    yield
+    if runner:
+        await runner.stop()
+    if agent:
+        await agent.close()
+
+
+app = FastAPI(title="GrokPC Agent", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins(),
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
+)
+app.include_router(novnc_router)
+
+
+# ---------------------------------------------------------------------------
+# Health, budget, compact status (for Grok Bot supervision)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/health")
+async def get_health(_auth: str = Depends(require_auth)):
+    body = _health_payload()
     try:
-        with socket.create_connection((host, port), timeout=0.3):
-            return True
-    except OSError:
-        return False
+        body["features"] = feature_flags()
+        body["phase"] = 1
+        current = running_job()
+        body["currentJobId"] = current["id"] if current else None
+    except Exception:
+        pass
+    return body
 
 
 @app.get("/api/budget")
 async def get_budget(_auth: str = Depends(require_auth)):
-    return budget_summary()
+    summary = budget_summary()
+    summary.update(today_stats())
+    settings = load_settings()
+    summary["dailyVideoCap"] = settings.get("daily_video_cap")
+    summary["dailySpendCapInr"] = settings.get("daily_spend_cap_inr")
+    return summary
 
 
-class WhatsAppRequest(BaseModel):
-    contact: str
-    message: str
-    attachment_path: str = ""
+@app.get("/api/status")
+async def get_status(_auth: str = Depends(require_auth)):
+    return await _status_payload()
 
 
-class GmailRequest(BaseModel):
-    recipient: str
-    subject: str = ""
-    body: str = ""
+@app.get("/api/credits")
+async def get_credits(_auth: str = Depends(require_auth)):
+    """Phase 2 balances. When the flag is off we only report spend, not site quotas."""
+    from config import FEATURE_CREDIT_CHECK
+
+    stats = today_stats()
+    return {
+        "phase": 2 if FEATURE_CREDIT_CHECK else 1,
+        "feature": FEATURE_CREDIT_CHECK,
+        "todaySpendInr": stats["spendInrToday"],
+        "providers": [],
+        "note": (
+            "Live Veo/Grok credit scrape is Phase 2 and off by default."
+            if not FEATURE_CREDIT_CHECK
+            else "Credit check enabled — run a generate step to record a decision."
+        ),
+    }
 
 
-class VideoRequest(BaseModel):
-    topic: str
-    script: str
+# ---------------------------------------------------------------------------
+# Channels + style + runtime settings
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/channels")
+async def api_list_channels(_auth: str = Depends(require_auth)):
+    return {"channels": list_channels()}
+
+
+class ChannelIn(BaseModel):
+    name: str
+    niche: str = ""
     language: str = "Hindi"
-    duration_seconds: int = 15
-    use_google_vids: bool = False
+    style: str = ""
+    youtube_url: str = ""
+    schedule: Optional[dict[str, Any]] = None
+    aspect: str = "16:9"
+    enabled: bool = True
+    id: Optional[str] = None
+
+
+@app.post("/api/channels")
+async def api_add_channel(req: ChannelIn, _auth: str = Depends(require_auth)):
+    try:
+        ch = add_channel(req.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"channel": ch}
+
+
+@app.put("/api/channels/{channel_id}")
+async def api_update_channel(channel_id: str, req: ChannelIn, _auth: str = Depends(require_auth)):
+    try:
+        ch = update_channel(channel_id, req.model_dump())
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Unknown channel")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"channel": ch}
+
+
+@app.delete("/api/channels/{channel_id}")
+async def api_delete_channel(channel_id: str, _auth: str = Depends(require_auth)):
+    try:
+        delete_channel(channel_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Unknown channel")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True}
+
+
+@app.get("/api/style-profile")
+async def api_get_style(_auth: str = Depends(require_auth)):
+    return {"profile": load_profile()}
+
+
+@app.put("/api/style-profile")
+async def api_put_style(payload: dict[str, Any], _auth: str = Depends(require_auth)):
+    return {"profile": save_profile(payload)}
+
+
+@app.get("/api/settings")
+async def api_get_settings(_auth: str = Depends(require_auth)):
+    return {"settings": load_settings(), "features": feature_flags()}
+
+
+class SettingsIn(BaseModel):
+    quiet_hours: Optional[str] = None
+    idle_seconds: Optional[int] = None
+    daily_video_cap: Optional[int] = None
+    daily_spend_cap_inr: Optional[float] = None
+    autopilot_enabled: Optional[bool] = None
+
+
+@app.put("/api/settings")
+@app.post("/api/settings")
+async def api_put_settings(req: SettingsIn, _auth: str = Depends(require_auth)):
+    data = save_settings(req.model_dump(exclude_none=True))
+    return {"settings": data, "features": feature_flags()}
+
+
+@app.get("/api/autopilot")
+async def api_get_autopilot(_auth: str = Depends(require_auth)):
+    settings = load_settings()
+    from scheduler import should_run_autopilot
+
+    ok, reason = should_run_autopilot(settings)
+    return {
+        "feature": FEATURE_AUTOPILOT,
+        "enabled": bool(settings.get("autopilot_enabled")) and FEATURE_AUTOPILOT,
+        "would_run": ok,
+        "reason": reason,
+        "settings": settings,
+        "note": None if FEATURE_AUTOPILOT else "Phase 2 — FEATURE_AUTOPILOT is off. Toggle does nothing until the flag is enabled.",
+    }
+
+
+class AutopilotIn(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/autopilot")
+async def api_set_autopilot(req: AutopilotIn, _auth: str = Depends(require_auth)):
+    data = save_settings({"autopilot_enabled": req.enabled})
+    return {
+        "feature": FEATURE_AUTOPILOT,
+        "enabled": bool(data.get("autopilot_enabled")) and FEATURE_AUTOPILOT,
+        "settings": data,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Jobs
+# ---------------------------------------------------------------------------
+
+
+class JobIn(BaseModel):
+    channel_id: str
+    topic: str
+    idea: str = ""
+    autopilot: bool = False
+
+
+@app.get("/api/jobs")
+async def api_list_jobs(
+    limit: int = 50,
+    status: Optional[str] = None,
+    channel_id: Optional[str] = None,
+    _auth: str = Depends(require_auth),
+):
+    return {"jobs": list_jobs(limit=limit, status=status, channel_id=channel_id)}
+
+
+@app.post("/api/jobs")
+async def api_create_job(req: JobIn, _auth: str = Depends(require_auth)):
+    topic = req.topic.strip()
+    if not topic:
+        raise HTTPException(status_code=400, detail="Topic is required")
+    if req.channel_id and not get_channel(req.channel_id):
+        # Still allow unknown ids so tests / first-run can pass a placeholder,
+        # but prefer known channels.
+        if not req.channel_id.startswith("ch"):
+            raise HTTPException(status_code=404, detail="Unknown channel")
+    job = create_job(
+        channel_id=req.channel_id,
+        topic=topic,
+        idea=req.idea.strip(),
+        autopilot=req.autopilot,
+    )
+    await broadcast(
+        {
+            "type": "system",
+            "title": "New job",
+            "message": f"{job['topic']} ({job['id']})",
+            "jobId": job["id"],
+        }
+    )
+    if runner:
+        await runner.enqueue_and_kick(job["id"])
+    return {"job": job, "status": "queued"}
+
+
+@app.get("/api/jobs/{job_id}")
+async def api_get_job(job_id: str, _auth: str = Depends(require_auth)):
+    job = get_job(job_id, with_logs=True, log_limit=80)
+    if not job:
+        raise HTTPException(status_code=404, detail="Unknown job")
+    return {"job": job}
+
+
+@app.get("/api/jobs/{job_id}/logs")
+async def api_job_logs(job_id: str, limit: int = 200, _auth: str = Depends(require_auth)):
+    if not get_job(job_id):
+        raise HTTPException(status_code=404, detail="Unknown job")
+    return {"logs": list_logs(job_id, limit=limit)}
+
+
+@app.post("/api/jobs/{job_id}/pause")
+async def api_pause_job(job_id: str, _auth: str = Depends(require_auth)):
+    if not get_job(job_id):
+        raise HTTPException(status_code=404, detail="Unknown job")
+    job = pause_job(job_id)
+    await broadcast({"type": "system", "title": "Job paused", "message": job_id, "jobId": job_id})
+    return {"job": job}
+
+
+@app.post("/api/jobs/{job_id}/resume")
+async def api_resume_job(job_id: str, _auth: str = Depends(require_auth)):
+    if not get_job(job_id):
+        raise HTTPException(status_code=404, detail="Unknown job")
+    job = resume_job(job_id)
+    if runner:
+        await runner.enqueue_and_kick(job_id)
+    await broadcast({"type": "system", "title": "Job resumed", "message": job_id, "jobId": job_id})
+    return {"job": job}
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+async def api_cancel_job(job_id: str, _auth: str = Depends(require_auth)):
+    if not get_job(job_id):
+        raise HTTPException(status_code=404, detail="Unknown job")
+    job = cancel_job(job_id)
+    await broadcast({"type": "system", "title": "Job cancelled", "message": job_id, "jobId": job_id})
+    return {"job": job}
+
+
+@app.post("/api/jobs/{job_id}/approve-publish")
+async def api_approve_publish(job_id: str, _auth: str = Depends(require_auth)):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Unknown job")
+    if not FEATURE_YOUTUBE_UPLOAD:
+        raise HTTPException(
+            status_code=409,
+            detail="YouTube publish is Phase 2 and FEATURE_YOUTUBE_UPLOAD is off. The final file is already on disk.",
+        )
+    if not job.get("youtube_id"):
+        raise HTTPException(status_code=409, detail="This job has no private YouTube upload yet")
+    from youtube_upload import approve_publish
+
+    result = await approve_publish(job["youtube_id"], agent=agent, log=broadcast)
+    if result.get("status") in {"ok", "success"}:
+        append_log(job_id, "info", "Approved publish (Public)", step="upload")
+        job = update_job(job_id, youtube_privacy="public", status="completed")
+    else:
+        append_log(job_id, "error", f"Publish failed: {result}", step="upload")
+    return {"job": job, "result": result}
+
+
+# ---------------------------------------------------------------------------
+# Existing vision task + leftover video shortcut (kept working)
+# ---------------------------------------------------------------------------
 
 
 class TaskRequest(BaseModel):
     prompt: str
 
 
-class ApprovalDecision(BaseModel):
-    approval_id: str
-    approved: bool
-    modified_content: Optional[str] = None
-
-
-def _queue_approval(kind: str, title: str, recipient: str, content: str, extra: dict[str, Any]) -> dict[str, Any]:
-    approval_id = f"{kind}_{uuid.uuid4().hex[:10]}"
-    pending[approval_id] = {
-        "id": approval_id,
-        "type": kind,
-        "title": title,
-        "recipient": recipient,
-        "previewContent": content,
-        "createdAt": time.strftime("%H:%M:%S"),
-        "resolved": False,
-        **extra,
-    }
-    return {
-        "status": "pending_approval",
-        "approval_id": approval_id,
-        "approval": {k: pending[approval_id][k] for k in ("id", "type", "title", "recipient", "previewContent", "createdAt")},
-    }
-
-
-@app.post("/api/whatsapp/send")
-async def send_whatsapp(req: WhatsAppRequest, _auth: str = Depends(require_auth)):
-    queued = _queue_approval(
-        "whatsapp",
-        "WhatsApp dispatch",
-        req.contact,
-        req.message,
-        {"contact": req.contact, "message": req.message, "attachment_path": req.attachment_path},
-    )
-    await broadcast({"type": "approval", "title": "Approval required", "message": f"WhatsApp to {req.contact}", "pendingApproval": queued["approval"]})
-    if telegram:
-        await telegram.send_approval(queued["approval_id"], "WhatsApp dispatch", req.contact, req.message)
-    return queued
-
-
-@app.post("/api/gmail/send")
-async def send_gmail(req: GmailRequest, _auth: str = Depends(require_auth)):
-    queued = _queue_approval(
-        "gmail",
-        "Gmail send",
-        req.recipient,
-        req.body,
-        {"recipient": req.recipient, "subject": req.subject, "body": req.body},
-    )
-    await broadcast({"type": "approval", "title": "Approval required", "message": f"Email to {req.recipient}", "pendingApproval": queued["approval"]})
-    if telegram:
-        await telegram.send_approval(queued["approval_id"], f"Gmail: {req.subject}", req.recipient, req.body)
-    return queued
-
-
-@app.post("/api/approve")
-async def approve(req: ApprovalDecision, _auth: str = Depends(require_auth)):
-    return await resolve_approval(req.approval_id, req.approved, req.modified_content)
-
-
-@app.post("/api/vids/generate")
-@app.post("/api/video/generate")
-async def generate_video(req: VideoRequest, _auth: str = Depends(require_auth)):
-    async def _run():
-        try:
-            if req.use_google_vids:
-                task = (
-                    f"Open Google Vids (https://docs.google.com/videos) and try to start a video about: {req.topic}. "
-                    "If the UI is unavailable, stop and report what you see."
-                )
-                result = await agent.run_generic_task(task)
-                await broadcast({"type": "action", "title": "Google Vids task", "message": str(result.get("result") or result)[:500]})
-            result = await render_video(
-                topic=req.topic,
-                script=req.script,
-                language=req.language,
-                duration_seconds=req.duration_seconds,
-                log=broadcast,
-            )
-            await broadcast({"type": "system", "title": "Video pipeline finished", "message": result.get("video_path", "")})
-        except Exception as exc:
-            logger.exception("video pipeline")
-            await broadcast({"type": "error", "title": "Video failed", "message": str(exc)})
-
-    asyncio.create_task(_run())
-    return {"status": "started", "message": "FFmpeg + gTTS pipeline started (Gemini TTS if enabled)."}
+class VideoRequest(BaseModel):
+    topic: str
+    script: str = ""
+    language: str = "Hindi"
+    duration_seconds: int = 15
+    use_google_vids: bool = False
+    channel_id: str = ""
 
 
 @app.post("/api/task")
 async def run_task(req: TaskRequest, _auth: str = Depends(require_auth)):
+    """Unchanged vision-agent entry point — 'youtube kholo' still goes here."""
     prompt = req.prompt.strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="Empty prompt")
-    lower = prompt.lower()
-
-    # Route obvious WhatsApp / Gmail / video requests, but still require approval for sends.
-    if "whatsapp" in lower or lower.startswith("wa "):
-        contact = "Unknown"
-        # very light parse: "whatsapp Rahul: hello"
-        rest = prompt
-        for prefix in ("whatsapp", "wa"):
-            if lower.startswith(prefix):
-                rest = prompt[len(prefix):].strip(" :,-")
-                break
-        if ":" in rest:
-            contact, _, message = rest.partition(":")
-        else:
-            contact, message = rest, prompt
-        return await send_whatsapp(WhatsAppRequest(contact=contact.strip() or "Unknown", message=message.strip() or prompt), _auth)
 
     async def _run():
         try:
@@ -776,6 +992,36 @@ async def run_task(req: TaskRequest, _auth: str = Depends(require_auth)):
 
     asyncio.create_task(_run())
     return {"status": "started", "message": "Vision agent started"}
+
+
+@app.post("/api/vids/generate")
+@app.post("/api/video/generate")
+async def generate_video(req: VideoRequest, _auth: str = Depends(require_auth)):
+    """Legacy shortcut. If a channel is given, create a proper job; otherwise
+    run the old FFmpeg+gTTS path so existing clients keep working.
+    """
+    if req.channel_id:
+        job = create_job(channel_id=req.channel_id, topic=req.topic, idea=req.script)
+        if runner:
+            await runner.enqueue_and_kick(job["id"])
+        return {"status": "queued", "job": job}
+
+    async def _run():
+        try:
+            result = await render_video(
+                topic=req.topic,
+                script=req.script or req.topic,
+                language=req.language,
+                duration_seconds=req.duration_seconds,
+                log=broadcast,
+            )
+            await broadcast({"type": "system", "title": "Video pipeline finished", "message": result.get("video_path", "")})
+        except Exception as exc:
+            logger.exception("video pipeline")
+            await broadcast({"type": "error", "title": "Video failed", "message": str(exc)})
+
+    asyncio.create_task(_run())
+    return {"status": "started", "message": "FFmpeg + gTTS pipeline started (Gemini TTS if enabled)."}
 
 
 @app.websocket("/ws")
@@ -803,9 +1049,10 @@ async def websocket_logs(websocket: WebSocket):
                 msg = json.loads(raw)
             except json.JSONDecodeError:
                 continue
-            # Optional client commands over the same socket
             if msg.get("cmd") == "ping":
-                await websocket.send_text(json.dumps({"type": "system", "title": "pong", "timestamp": time.strftime("%H:%M:%S")}))
+                await websocket.send_text(
+                    json.dumps({"type": "system", "title": "pong", "timestamp": time.strftime("%H:%M:%S")})
+                )
     except WebSocketDisconnect:
         if websocket in clients:
             clients.remove(websocket)
@@ -819,10 +1066,10 @@ if __name__ == "__main__":
   {
     name: "agent_core.py",
     path: "/app/agent/agent_core.py",
-    description: "Playwright persistent browser, WhatsApp/Gmail helpers, vision-loop tasks.",
+    description: "Playwright persistent browser and vision-loop tasks (YouTube etc.).",
     language: "python",
     category: "python",
-    content: `"""Playwright persistent browser + WhatsApp/Gmail helpers + vision-loop tasks."""
+    content: `"""Playwright persistent browser + vision-loop tasks (the path that already opened YouTube)."""
 from __future__ import annotations
 
 import asyncio
@@ -956,109 +1203,12 @@ class BrowserAgentCore:
                 return result
             finally:
                 self.is_busy = False
-
-    async def run_whatsapp_send(self, contact: str, message: str, file_path: Optional[str] = None) -> dict[str, Any]:
-        """Best-effort WhatsApp Web send using the persistent profile. Call only after approval."""
-        async with self._lock:
-            self.is_busy = True
-            try:
-                await self.initialize_browser()
-                assert self.page is not None
-                await self.emit("action", "WhatsApp Web", f"Opening chat for {contact}")
-                await self.page.goto("https://web.whatsapp.com", wait_until="domcontentloaded")
-                await asyncio.sleep(4)
-                qr = await self.page.query_selector("canvas[aria-label*='QR'], canvas[aria-label*='qr']")
-                if qr:
-                    await self.emit(
-                        "approval",
-                        "WhatsApp Auth Required",
-                        "Scan the QR code in the live desktop (noVNC), then retry.",
-                    )
-                    return {"status": "auth_required", "message": "Scan WhatsApp QR in noVNC"}
-
-                search = await self.page.wait_for_selector(
-                    "div[contenteditable='true'][data-tab='3'], div[title='Search input textbox'], [data-testid='chat-list-search']",
-                    timeout=20000,
-                )
-                await search.click()
-                await self.page.keyboard.type(contact, delay=30)
-                await asyncio.sleep(1.2)
-                await self.page.keyboard.press("Enter")
-                await asyncio.sleep(1.5)
-
-                box = await self.page.wait_for_selector(
-                    "div[contenteditable='true'][data-tab='10'], footer div[contenteditable='true'], [data-testid='conversation-compose-box-input']",
-                    timeout=15000,
-                )
-                await box.click()
-                await self.page.keyboard.type(message, delay=20)
-
-                if file_path and os.path.exists(file_path):
-                    file_input = await self.page.query_selector("input[type='file']")
-                    if file_input:
-                        await file_input.set_input_files(file_path)
-                        await asyncio.sleep(2)
-
-                await self.page.keyboard.press("Enter")
-                await asyncio.sleep(1.5)
-                await self.emit("action", "WhatsApp Sent", f"Sent to {contact}")
-                return {"status": "success", "contact": contact}
-            except Exception as exc:
-                logger.exception("WhatsApp send failed")
-                # Fall back to the vision loop so a changed DOM can still be handled.
-                await self.emit("system", "Selector miss", f"{exc}; switching to vision loop")
-                task = f"On WhatsApp Web, open the chat with '{contact}' and send this message exactly: {message}"
-                return await run_vision_task(self.page, task, log=self.log_callback)
-            finally:
-                self.is_busy = False
-
-    async def run_gmail_send(self, recipient: str, subject: str, body: str) -> dict[str, Any]:
-        """Best-effort Gmail compose. Call only after approval."""
-        async with self._lock:
-            self.is_busy = True
-            try:
-                await self.initialize_browser()
-                assert self.page is not None
-                await self.emit("action", "Gmail", f"Composing email to {recipient}")
-                await self.page.goto("https://mail.google.com/mail/u/0/#inbox", wait_until="domcontentloaded")
-                await asyncio.sleep(3)
-                if "accounts.google.com" in (self.page.url or ""):
-                    await self.emit(
-                        "approval",
-                        "Gmail Auth Required",
-                        "Log into Google in the live desktop (noVNC), then retry.",
-                    )
-                    return {"status": "auth_required", "message": "Log into Gmail in noVNC"}
-                compose = self.page.locator("div[gh='cm'], div[role='button']:has-text('Compose')").first
-                await compose.click(timeout=15000)
-                await asyncio.sleep(1)
-                to_box = self.page.locator("input[peoplekit-id], textarea[name='to'], input[aria-label*='To']").first
-                await to_box.fill(recipient)
-                subj = self.page.locator("input[name='subjectbox']").first
-                await subj.fill(subject)
-                body_box = self.page.locator("div[aria-label='Message Body'], div[role='textbox'][aria-label*='Body']").first
-                await body_box.click()
-                await self.page.keyboard.type(body, delay=15)
-                await self.page.keyboard.press("Control+Enter")
-                await asyncio.sleep(2)
-                await self.emit("action", "Gmail Sent", f"Sent to {recipient}")
-                return {"status": "success", "recipient": recipient}
-            except Exception as exc:
-                logger.exception("Gmail send failed")
-                await self.emit("system", "Selector miss", f"{exc}; switching to vision loop")
-                task = (
-                    f"In Gmail, compose and send an email to {recipient} "
-                    f"with subject '{subject}' and body: {body}"
-                )
-                return await run_vision_task(self.page, task, log=self.log_callback)
-            finally:
-                self.is_busy = False
 `,
   },
   {
     name: "vision_loop.py",
     path: "/app/agent/vision_loop.py",
-    description: "Screenshot → DeepSeek Flash multimodal (Gemini fallback) → JSON click/type/scroll/goto.",
+    description: "Driver-agnostic vision loop: screenshot → DeepSeek Flash (Gemini fallback) → JSON actions. Browser or Windows desktop.",
     language: "python",
     category: "python",
     content: `"""Playwright vision loop: screenshot -> DeepSeek Flash (multimodal) or Gemini fallback -> JSON action."""
@@ -1080,6 +1230,9 @@ from config import (
     GEMINI_API_KEY,
     GEMINI_VISION_MODEL,
     MAX_VISION_STEPS,
+    SCREENSHOT_FORMAT,
+    SCREENSHOT_QUALITY,
+    SCREENSHOT_TO_UI,
 )
 from db import record_usage
 
@@ -1105,7 +1258,8 @@ Rules:
 - "type" types into the currently focused or last-clicked field.
 - "press" uses a key name like Enter, Tab, Escape, Backspace.
 - "scroll" uses amount in pixels (positive = down).
-- "goto" navigates to url.
+- "goto" navigates to url. To open any website, always use "goto" with the full URL.
+- You control ONE tab that is already private (incognito-like). Browser shortcuts for new tabs/windows (Ctrl+T, Ctrl+N, Ctrl+Shift+N) do not work; never use them.
 - "wait" waits amount milliseconds (default 1000).
 - "done" when the task is finished or blocked; put the result in "text".
 """
@@ -1270,34 +1424,63 @@ async def decide(prompt: str, screenshot_png: bytes, mock: Optional[MockLLM] = N
     raise RuntimeError("No vision LLM configured (set DEEPSEEK_API_KEY or GEMINI_API_KEY, or DRY_RUN=1)")
 
 
+_KEY_ALIASES = {
+    "ctrl": "Control", "control": "Control", "cmd": "Meta", "command": "Meta", "win": "Meta",
+    "windows": "Meta", "super": "Meta", "meta": "Meta", "alt": "Alt", "option": "Alt",
+    "shift": "Shift", "esc": "Escape", "escape": "Escape", "del": "Delete", "delete": "Delete",
+    "enter": "Enter", "return": "Enter", "tab": "Tab", "space": " ", "backspace": "Backspace",
+    "up": "ArrowUp", "down": "ArrowDown", "left": "ArrowLeft", "right": "ArrowRight",
+    "pageup": "PageUp", "pagedown": "PageDown", "home": "Home", "end": "End",
+}
+
+
+def _normalize_key(key: str) -> str:
+    parts = [p.strip() for p in re.split(r"\\s*\\+\\s*", str(key).strip()) if p.strip()]
+    out = []
+    for p in parts:
+        alias = _KEY_ALIASES.get(p.lower())
+        if alias:
+            out.append(alias)
+        elif len(p) == 1:
+            out.append(p.lower() if len(parts) > 1 else p)
+        else:
+            out.append(p[0].upper() + p[1:])
+    return "+".join(out) or "Enter"
+
+
 async def apply_action(page, action: dict[str, Any]) -> str:
+    """Apply one model action. \`page\` may be a Playwright Page or a Driver."""
+    try:
+        return await _apply_action(page, action)
+    except Exception as exc:  # let the model see the error and try something else
+        logger.warning("action failed: %s", exc)
+        return f"Action failed: {str(exc)[:200]}. Try a different action (e.g. goto with full URL)."
+
+
+async def _apply_action(page, action: dict[str, Any]) -> str:
+    from drivers import as_driver
+
+    driver = as_driver(page)
     kind = (action.get("action") or "done").lower().strip()
     if kind == "goto":
-        url = action.get("url") or ""
-        await page.goto(url, wait_until="domcontentloaded")
-        return f"Navigated to {url}"
+        return await driver.goto(action.get("url") or "")
     if kind == "click":
         x, y = int(action.get("x") or 0), int(action.get("y") or 0)
-        await page.mouse.click(x, y)
-        return f"Clicked ({x},{y})"
+        return await driver.click(x, y)
     if kind == "type":
-        text = action.get("text") or ""
-        await page.keyboard.type(text, delay=20)
-        return f"Typed {len(text)} chars"
+        return await driver.type_text(action.get("text") or "")
     if kind == "press":
-        key = action.get("key") or "Enter"
-        await page.keyboard.press(key)
-        return f"Pressed {key}"
+        key = _normalize_key(action.get("key") or "Enter")
+        return await driver.press(key)
     if kind == "scroll":
         amount = int(action.get("amount") or 400)
-        await page.mouse.wheel(0, amount)
-        return f"Scrolled {amount}px"
+        return await driver.scroll(amount)
     if kind == "wait":
-        import asyncio
-
         ms = int(action.get("amount") or 1000)
-        await asyncio.sleep(ms / 1000)
-        return f"Waited {ms}ms"
+        return await driver.wait(ms)
+    if kind == "launch":
+        app = action.get("text") or action.get("url") or action.get("app") or ""
+        return await driver.launch(app)
     if kind == "done":
         return action.get("text") or action.get("thought") or "Done"
     return f"Unknown action {kind}"
@@ -1305,12 +1488,22 @@ async def apply_action(page, action: dict[str, Any]) -> str:
 
 
 async def _capture_screenshot(page) -> tuple[bytes, str]:
-    fmt = (SCREENSHOT_FORMAT or "png").lower()
-    if fmt in {"jpg", "jpeg"}:
-        data = await page.screenshot(type="jpeg", quality=max(1, min(SCREENSHOT_QUALITY, 100)), full_page=False)
-        return data, "image/jpeg"
-    data = await page.screenshot(type="png", full_page=False)
-    return data, "image/png"
+    from drivers import as_driver
+
+    driver = as_driver(page)
+    return await driver.screenshot()
+
+
+def _driver_system_note(kind: str) -> str:
+    if kind == "windows":
+        return (
+            "You are driving a Windows desktop (not a browser tab). "
+            "Coordinates are screen pixels from the top-left. "
+            "Use click/type/press/scroll/launch/wait. "
+            "'goto' is not available. 'launch' opens an installed app (e.g. capcut). "
+            "Key names: Enter, Tab, Control+i, Alt+F4, Control+s."
+        )
+    return ""
 
 
 async def run_vision_task(
@@ -1322,15 +1515,23 @@ async def run_vision_task(
     max_steps: Optional[int] = None,
 ) -> dict[str, Any]:
     import asyncio
+    from drivers import as_driver
 
+    driver = as_driver(page)
     steps = max_steps or MAX_VISION_STEPS
     history: list[dict[str, Any]] = []
     last_result = ""
+    extra = _driver_system_note(getattr(driver, "kind", "browser"))
     for step in range(1, steps + 1):
-        image, mime = await _capture_screenshot(page)
+        image, mime = await driver.screenshot()
+        try:
+            url = await driver.current_url()
+        except Exception:
+            url = ""
         prompt = (
             f"Task: {task}\\n"
-            f"Step {step}/{steps}. URL: {page.url}\\n"
+            f"Step {step}/{steps}. Surface: {getattr(driver, 'kind', 'browser')} URL: {url}\\n"
+            f"{extra}\\n"
             f"Last result: {last_result or 'none'}\\n"
             "Decide the next single action."
         )
@@ -1359,7 +1560,7 @@ async def run_vision_task(
   {
     name: "video_pipeline.py",
     path: "/app/agent/video_pipeline.py",
-    description: "FFmpeg + free gTTS video pipeline; optional Gemini TTS behind a flag.",
+    description: "FFmpeg + free gTTS video pipeline; optional Gemini TTS; assemble_video fallback editor.",
     language: "python",
     category: "python",
     content: `"""FFmpeg + gTTS video pipeline. Optional Gemini TTS behind USE_GEMINI_TTS."""
@@ -1512,6 +1713,485 @@ async def render_video(
         "audio_path": str(audio),
         "voice_engine": engine,
     }
+
+
+
+async def write_silent_audio(dest: Path, seconds: float = 4.0) -> None:
+    """Generate a short silent MP3 with ffmpeg so DRY_RUN / offline boxes still work."""
+    import shutil
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if not shutil.which("ffmpeg"):
+        # Minimal valid-ish MP3 header + silence is hard; write a wav instead.
+        import wave, struct
+        dest_wav = dest.with_suffix(".wav")
+        with wave.open(str(dest_wav), "w") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(16000)
+            w.writeframes(b"\\x00\\x00" * int(16000 * seconds))
+        if dest.suffix.lower() != ".wav":
+            dest.write_bytes(dest_wav.read_bytes())
+        return
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "lavfi", "-i", f"anullsrc=r=16000:cl=mono",
+        "-t", str(max(1.0, seconds)),
+        "-c:a", "libmp3lame", "-q:a", "9",
+        str(dest),
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    _out, err = await proc.communicate()
+    if proc.returncode != 0 or not dest.is_file():
+        raise RuntimeError(err.decode("utf-8", "replace")[-800:] or "ffmpeg silent audio failed")
+
+
+async def synthesize_voice_safe(script: str, lang: str, dest: Path, log: Optional[LogFn] = None) -> str:
+    """Phase 1 voiceover: Gemini TTS (opt-in) -> gTTS -> silent ffmpeg (DRY_RUN / offline)."""
+    from config import DRY_RUN
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if DRY_RUN:
+        await _emit(log, "action", "Voiceover", "DRY_RUN silent audio (no gTTS network call)")
+        await write_silent_audio(dest, seconds=max(3.0, min(12.0, len(script or "") / 12)))
+        return "dry_run"
+    try:
+        return await synthesize_voice(script, lang, dest, log=log)
+    except Exception as exc:
+        logger.warning("Voiceover failed (%s); writing silent audio", exc)
+        await _emit(log, "system", "TTS fallback", f"{exc}; silent audio so edit can continue")
+        await write_silent_audio(dest, seconds=6.0)
+        return "silent"
+
+
+def _escape_drawtext(text: str) -> str:
+    # ffmpeg drawtext is picky: escape \\\\, :, ', %
+    cleaned = (text or "").replace("\\\\", " ").replace(":", " ").replace("'", "").replace("%", " ")
+    cleaned = cleaned.replace("\\n", " ")[:80]
+    return cleaned
+
+
+async def assemble_video(
+    *,
+    title: str,
+    audio_path: Optional[Path] = None,
+    images: Optional[list[Path]] = None,
+    clips: Optional[list[Path]] = None,
+    duration_seconds: int = 20,
+    aspect: str = "16:9",
+    log: Optional[LogFn] = None,
+    dest: Optional[Path] = None,
+) -> dict[str, Any]:
+    """FFmpeg auto-edit fallback (Phase 1 default editor).
+
+    - If clips are given, concat them and mux the voiceover.
+    - Else if images are given, make a simple slideshow + voiceover.
+    - Else a color title card + voiceover (same idea as render_video).
+    """
+    import shutil
+    import time as _time
+
+    if not shutil.which("ffmpeg"):
+        raise RuntimeError("ffmpeg is not installed")
+
+    out = dest
+    if out is None:
+        stamp = int(_time.time())
+        safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in title)[:40] or "video"
+        out = output_dir() / f"{safe}_{stamp}.mp4"
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    if aspect == "9:16":
+        size = "720x1280"
+    elif aspect == "1:1":
+        size = "720x720"
+    else:
+        size = "1280x720"
+
+    await _emit(log, "terminal", "FFmpeg", f"Assembling {out.name} ({size})")
+
+    duration = max(int(duration_seconds), 8)
+    audio_args: list[str] = []
+    if audio_path and Path(audio_path).is_file():
+        audio_args = ["-i", str(audio_path)]
+
+    async def _run(cmd: list[str]) -> tuple[int, str]:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        _o, err = await proc.communicate()
+        return proc.returncode, err.decode("utf-8", "replace")[-1500:]
+
+    clips = [Path(c) for c in (clips or []) if Path(c).is_file()]
+    images = [Path(i) for i in (images or []) if Path(i).is_file()]
+
+    if clips:
+        lst = out.with_suffix(".concat.txt")
+        lst.write_text("".join(f"file '{c}'\\n" for c in clips), encoding="utf-8")
+        cmd = [
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(lst),
+            *audio_args,
+            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "128k",
+            "-shortest", "-movflags", "+faststart",
+            str(out),
+        ]
+        code, err = await _run(cmd)
+        if code == 0 and out.is_file():
+            await _emit(log, "system", "Video ready", f"Saved to {out}")
+            record_usage(task_type="video", status="ok", details=str(out), provider="ffmpeg", model="concat")
+            return {"status": "success", "video_path": str(out), "engine": "ffmpeg-concat"}
+
+    if images:
+        # One image held for \`duration / n\` each, scaled to size.
+        per = max(2.0, duration / max(len(images), 1))
+        # Use the first image as a simple Ken-Burns-less still sequence via lavfi is complex;
+        # a reliable path: loop first image, or concat stills.
+        first = images[0]
+        cmd = [
+            "ffmpeg", "-y",
+            "-loop", "1", "-t", str(duration), "-i", str(first),
+            *audio_args,
+            "-vf", f"scale={size}:force_original_aspect_ratio=decrease,pad={size}:(ow-iw)/2:(oh-ih)/2",
+            "-c:v", "libx264", "-tune", "stillimage", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "128k",
+            "-shortest", "-movflags", "+faststart",
+            str(out),
+        ]
+        code, err = await _run(cmd)
+        if code == 0 and out.is_file():
+            await _emit(log, "system", "Video ready", f"Saved to {out}")
+            record_usage(task_type="video", status="ok", details=str(out), provider="ffmpeg", model="slideshow")
+            return {"status": "success", "video_path": str(out), "engine": "ffmpeg-image"}
+
+    label = _escape_drawtext(title)
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "lavfi", "-i", f"color=c=0x0a101f:s={size}:d={duration}",
+        *audio_args,
+        "-filter_complex",
+        f"drawtext=text='{label}':fontcolor=white:fontsize=36:x=(w-text_w)/2:y=(h-text_h)/2",
+        "-c:v", "libx264", "-tune", "stillimage", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k",
+        "-shortest", "-movflags", "+faststart",
+        str(out),
+    ]
+    code, err = await _run(cmd)
+    if code != 0:
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "lavfi", "-i", f"color=c=0x0a101f:s={size}:d={duration}",
+            *audio_args,
+            "-c:v", "libx264", "-tune", "stillimage", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "128k",
+            "-shortest", "-movflags", "+faststart",
+            str(out),
+        ]
+        code, err = await _run(cmd)
+        if code != 0:
+            raise RuntimeError(err or "ffmpeg title-card failed")
+
+    await _emit(log, "system", "Video ready", f"Saved to {out}")
+    record_usage(task_type="video", status="ok", details=str(out), provider="ffmpeg", model="titlecard")
+    return {"status": "success", "video_path": str(out), "engine": "ffmpeg-titlecard"}
+`,
+  },
+  {
+    name: "pipeline.py",
+    path: "/app/agent/pipeline.py",
+    description: "Phase 1 job orchestrator: story (ChatGPT/DeepSeek) → voiceover → FFmpeg/CapCut edit.",
+    language: "python",
+    category: "python",
+    content: `"""Phase 1 video pipeline orchestrator.
+
+Order (Phase 1): story+prompts -> voiceover -> FFmpeg edit (CapCut prepared if helper is up).
+Optional Phase 2 steps (generate, upload) are inserted only when their flags are on.
+
+The currently working /api/task vision agent is independent: this runner uses
+the same BrowserAgentCore lock when it needs the browser (ChatGPT planning),
+and otherwise does not touch the Playwright session.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Optional
+
+from config import (
+    DRY_RUN,
+    FEATURE_AUTOPILOT,
+    FEATURE_GROK_IMAGINE,
+    FEATURE_VEO,
+    FEATURE_YOUTUBE_UPLOAD,
+    output_dir,
+    pipeline_steps,
+)
+from channels import get_channel
+from editors import edit_video
+from jobs import (
+    append_log,
+    cancel_job,
+    get_job,
+    next_queued,
+    pause_job,
+    running_job,
+    set_step,
+    update_job,
+)
+from planner import plan_story
+from video_pipeline import synthesize_voice_safe
+
+logger = logging.getLogger("grokpc.pipeline")
+LogFn = Callable[[dict[str, Any]], Awaitable[None]]
+
+
+class PipelineRunner:
+    def __init__(self, agent: Any = None, broadcast: Optional[LogFn] = None):
+        self.agent = agent
+        self.broadcast = broadcast
+        self._task: Optional[asyncio.Task] = None
+        self._stop = asyncio.Event()
+        self._run_lock = asyncio.Lock()
+        self.current_job_id: Optional[str] = None
+
+    async def start(self) -> None:
+        if self._task is None:
+            self._stop.clear()
+            self._task = asyncio.create_task(self._loop(), name="pipeline-runner")
+
+    async def stop(self) -> None:
+        self._stop.set()
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._task = None
+
+    async def enqueue_and_kick(self, job_id: str) -> None:
+        # The loop will pick it up; also try immediately if idle.
+        if self._run_lock.locked():
+            return
+        asyncio.create_task(self._maybe_run_one(), name=f"kick-{job_id}")
+
+    async def _loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                await self._maybe_run_one()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("pipeline loop")
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                pass
+
+    async def _maybe_run_one(self) -> None:
+        if self._run_lock.locked():
+            return
+        if running_job():
+            return
+        job = next_queued()
+        if not job:
+            return
+        async with self._run_lock:
+            await self.run_job(job["id"])
+
+    async def _emit(self, job_id: str, title: str, message: str, step: str = "", level: str = "info") -> None:
+        append_log(job_id, level, f"{title}: {message}" if title else message, step=step)
+        if self.broadcast:
+            await self.broadcast(
+                {
+                    "type": "action" if level != "error" else "error",
+                    "title": title or "Job",
+                    "message": message,
+                    "jobId": job_id,
+                    "step": step,
+                }
+            )
+
+    def _paused(self, job_id: str) -> Optional[dict[str, Any]]:
+        job = get_job(job_id)
+        if not job:
+            return {"status": "missing"}
+        if job["status"] in {"paused", "cancelled"}:
+            return job
+        return None
+
+    async def run_job(self, job_id: str) -> dict[str, Any]:
+        job = get_job(job_id)
+        if not job:
+            raise KeyError(job_id)
+        if job["status"] in {"completed", "cancelled"}:
+            return job
+        self.current_job_id = job_id
+        update_job(job_id, status="running", error="")
+        await self._emit(job_id, "Pipeline", f"Start: {job['topic']}", step=job.get("current_step") or "story")
+
+        try:
+            result = await self._run_steps(job_id)
+            return result
+        except Exception as exc:
+            logger.exception("job %s failed", job_id)
+            await self._emit(job_id, "Pipeline", str(exc), level="error")
+            set_step(job_id, (get_job(job_id) or {}).get("current_step") or "story", "failed", str(exc)[:500])
+            return update_job(job_id, status="failed", error=str(exc)[:800])
+        finally:
+            if self.current_job_id == job_id:
+                self.current_job_id = None
+
+    async def _run_steps(self, job_id: str) -> dict[str, Any]:
+        job = get_job(job_id)
+        assert job
+        channel = get_channel(job["channel_id"]) or {"id": job["channel_id"], "name": job["channel_id"], "language": "Hindi", "aspect": "16:9"}
+        steps = [s["name"] for s in job["steps"]] or pipeline_steps()
+
+        # Resume support: skip steps already successful.
+        done = {s["name"] for s in job["steps"] if s["status"] == "success"}
+
+        plan = job.get("plan") or {}
+        voice_path = Path(job["voice_path"]) if job.get("voice_path") else None
+        media_paths = [Path(p) for p in (job.get("media") or []) if p]
+        final_path = Path(job["final_path"]) if job.get("final_path") else None
+
+        for name in steps:
+            paused = self._paused(job_id)
+            if paused:
+                return paused
+
+            if name in done:
+                continue
+
+            set_step(job_id, name, "running", "")
+            update_job(job_id, status="running", current_step=name)
+            await self._emit(job_id, "Step", name, step=name)
+
+            if name == "story":
+                result = await plan_story(
+                    job["topic"],
+                    job.get("idea") or "",
+                    channel,
+                    agent=self.agent,
+                    log=self.broadcast,
+                )
+                plan = result.get("plan") or {}
+                update_job(job_id, plan_json=plan, provider=result.get("planner") or "")
+                note = result.get("note") or result.get("planner") or "ok"
+                set_step(job_id, "story", "success", f"{result.get('planner')}: {plan.get('title') or ''} {note}"[:500])
+                await self._emit(job_id, "Story", plan.get("title") or "planned", step="story")
+
+            elif name == "voiceover":
+                script = (plan or {}).get("voiceover_script") or job["topic"]
+                lang = channel.get("language") or "Hindi"
+                dest = output_dir() / f"voice_{job_id}.mp3"
+                engine = await synthesize_voice_safe(script, lang, dest, log=self.broadcast)
+                voice_path = dest
+                update_job(job_id, voice_path=str(dest))
+                set_step(job_id, "voiceover", "success", f"engine={engine}")
+                await self._emit(job_id, "Voiceover", f"{engine} -> {dest.name}", step="voiceover")
+
+            elif name == "generate":
+                if not (FEATURE_VEO or FEATURE_GROK_IMAGINE):
+                    set_step(job_id, "generate", "skipped", "Phase 2 flag off")
+                    continue
+                from generators import generate_media
+
+                dest = output_dir() / job_id
+                gen = await generate_media(
+                    plan or {},
+                    job_id=job_id,
+                    dest_dir=dest,
+                    agent=self.agent,
+                    log=self.broadcast,
+                )
+                if gen.get("status") == "waiting_credits":
+                    set_step(job_id, "generate", "failed", "waiting for credits")
+                    update_job(job_id, status="waiting_credits", credit_json=gen.get("credit") or gen)
+                    await self._emit(job_id, "Credits", "Koi provider ke tokens nahi mile — job ruk gayi", step="generate")
+                    return get_job(job_id)  # type: ignore
+                paths = [Path(p) for p in (gen.get("paths") or [])]
+                media_paths.extend(paths)
+                update_job(job_id, media_json=[str(p) for p in media_paths], provider=gen.get("provider") or "")
+                if gen.get("status") == "skipped":
+                    set_step(job_id, "generate", "skipped", gen.get("note") or "")
+                elif gen.get("status") in {"ok", "success"} and paths:
+                    set_step(job_id, "generate", "success", f"{len(paths)} files")
+                else:
+                    # Don't fail the whole job — FFmpeg can still build a title-card video.
+                    set_step(job_id, "generate", "skipped", gen.get("note") or gen.get("status") or "no media")
+
+            elif name == "edit":
+                title = (plan or {}).get("title") or job["topic"]
+                duration = 20
+                if plan and plan.get("scenes"):
+                    duration = max(8, sum(int(s.get("duration_sec") or 5) for s in plan["scenes"]))
+                aspect = channel.get("aspect") or "16:9"
+                images = [p for p in media_paths if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}]
+                clips = [p for p in media_paths if p.suffix.lower() in {".mp4", ".webm", ".mov", ".mkv"}]
+                dest = output_dir() / f"final_{job_id}.mp4"
+                edited = await edit_video(
+                    title=title,
+                    audio_path=voice_path,
+                    images=images,
+                    clips=clips,
+                    duration_seconds=duration,
+                    aspect=aspect,
+                    log=self.broadcast,
+                    dest=dest,
+                )
+                final_path = Path(edited["video_path"])
+                update_job(job_id, video_path=str(final_path), final_path=str(final_path))
+                detail = edited.get("editor") or "ffmpeg"
+                if edited.get("capcut"):
+                    detail += f" capcut={edited['capcut'].get('status')}"
+                set_step(job_id, "edit", "success", detail)
+                await self._emit(job_id, "Edit", str(final_path), step="edit")
+
+            elif name == "upload":
+                if not FEATURE_YOUTUBE_UPLOAD:
+                    set_step(job_id, "upload", "skipped", "Phase 2 flag off")
+                    continue
+                from youtube_upload import upload_private
+
+                if not final_path or not final_path.is_file():
+                    set_step(job_id, "upload", "failed", "no final video")
+                    return update_job(job_id, status="failed", error="upload: no final video")
+                up = await upload_private(
+                    final_path,
+                    title=(plan or {}).get("title") or job["topic"],
+                    description=(plan or {}).get("description") or "",
+                    tags=(plan or {}).get("tags") or [],
+                    channel=channel,
+                    agent=self.agent,
+                    log=self.broadcast,
+                )
+                if up.get("status") == "waiting_login":
+                    set_step(job_id, "upload", "failed", "YouTube login needed")
+                    return update_job(job_id, status="waiting_login", error=up.get("note") or "YouTube login")
+                if up.get("status") == "skipped":
+                    set_step(job_id, "upload", "skipped", up.get("note") or "")
+                elif up.get("status") in {"ok", "success"}:
+                    update_job(
+                        job_id,
+                        youtube_id=str(up.get("youtube_id") or ""),
+                        youtube_privacy=up.get("privacy") or "private",
+                    )
+                    set_step(job_id, "upload", "success", f"private {up.get('youtube_id')}")
+                    return update_job(job_id, status="waiting_approval")
+                else:
+                    set_step(job_id, "upload", "failed", up.get("note") or up.get("status") or "")
+                    return update_job(job_id, status="failed", error=f"upload: {up}")
+
+            else:
+                set_step(job_id, name, "skipped", "unknown step")
+
+        await self._emit(job_id, "Pipeline", "Complete", step="edit")
+        return update_job(job_id, status="completed")
 `,
   },
   {
@@ -1537,14 +2217,16 @@ websockets==13.1
     description: "Environment template. Real secrets stay on the VM in /app/agent/.env.",
     language: "plaintext",
     category: "config",
-    content: `# Copy to /app/agent/.env on the Oracle VM. Never commit a filled copy.
-# The setup script generates AGENT_TOKEN for you.
+    content: `# Copy to /app/agent/.env on the machine. Never commit a filled copy.
+# The setup script generates AGENT_TOKEN for you. Existing laptop .env is never overwritten.
 
 AGENT_TOKEN=change-me-long-random
 DEEPSEEK_API_KEY=
 GEMINI_API_KEY=
-TELEGRAM_BOT_TOKEN=
-TELEGRAM_CHAT_ID=
+# Messaging (WhatsApp / Gmail / Telegram) was removed in Phase 1. These names
+# are ignored if still present in an older .env.
+# TELEGRAM_BOT_TOKEN=
+# TELEGRAM_CHAT_ID=
 
 HOST=127.0.0.1
 PORT=8000
@@ -1558,7 +2240,7 @@ GDRIVE_DIR=/mnt/gdrive
 OUTPUT_DIR=
 DB_PATH=/app/data/agent_tasks.db
 
-# Optional paid voice. Default is free gTTS.
+# Optional paid voice. Default is free gTTS (silent ffmpeg in DRY_RUN).
 USE_GEMINI_TTS=0
 GEMINI_TTS_MODEL=gemini-3.8-flash-lite-tts
 GEMINI_VISION_MODEL=gemini-2.5-flash
@@ -1568,9 +2250,9 @@ DEEPSEEK_MODEL=deepseek-flash
 USD_INR_RATE=88
 MONTHLY_CAP_INR=1000
 
-# 1 = no real LLM calls, mock actions (for tests)
+# 1 = no real LLM calls, mock plan + silent audio + FFmpeg (for tests)
 DRY_RUN=0
-# 1 = Playwright headless (use 0 on the VM so you can watch in noVNC)
+# 1 = Playwright headless (use 0 on the laptop so you can watch in noVNC)
 HEADLESS=0
 MAX_VISION_STEPS=12
 
@@ -1583,6 +2265,7 @@ VIEWPORT_HEIGHT=
 
 # Termux / Android tablet: set ANDROID=1, point at system Chromium, skip bundled browsers.
 # Playwright does not officially support Android; we connect over CDP (preferred) or executable_path.
+# Tablet rollout is Phase 2 — laptop first.
 ANDROID=0
 CDP_URL=
 CHROMIUM_PATH=
@@ -1590,6 +2273,31 @@ PLAYWRIGHT_BROWSERS_PATH=
 SCREENSHOT_FORMAT=
 SCREENSHOT_QUALITY=45
 SCREENSHOT_TO_UI=
+
+# --- Phase 1 (defaults already on; you usually don't need to set these) ---
+FEATURE_CAPCUT=1
+FEATURE_CHATGPT_PLANNER=1
+PLANNER=chatgpt
+# Windows desktop helper (CapCut, screenshots, idle). WSL localhost forwarding.
+WINDOWS_HELPER_URL=http://127.0.0.1:8765
+WINDOWS_HELPER_TOKEN=
+# Optional: Windows-visible media folder, e.g. /mnt/c/Users/YOURNAME/Videos/GrokPC
+WINDOWS_MEDIA_DIR=
+
+# Daily caps / quiet hours (saved from the app Settings too). Autopilot itself is Phase 2.
+QUIET_HOURS=23:00-07:00
+IDLE_SECONDS=900
+DAILY_VIDEO_CAP=3
+DAILY_SPEND_CAP_INR=40
+AUTOPILOT_ENABLED=0
+
+# --- Phase 2 (default OFF — do not turn on until tested on the laptop) ---
+FEATURE_VEO=0
+FEATURE_GROK_IMAGINE=0
+FEATURE_YOUTUBE_UPLOAD=0
+FEATURE_AUTOPILOT=0
+FEATURE_CREDIT_CHECK=0
+FEATURE_AISTUDIO_VOICE=0
 `,
   }
 ];

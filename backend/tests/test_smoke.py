@@ -23,6 +23,13 @@ os.environ.update(
         "CHROME_PROFILE_DIR": str(TMP / "chrome"),
         "OUTPUT_DIR": str(TMP / "out"),
         "FRONTEND_ORIGINS": "http://testserver",
+        "CHANNELS_PATH": str(TMP / "channels.json"),
+        "STYLE_PROFILE_PATH": str(TMP / "style.json"),
+        "RUNTIME_SETTINGS_PATH": str(TMP / "settings.json"),
+        "WINDOWS_HELPER_URL": "http://127.0.0.1:1",
+        "FEATURE_VEO": "0",
+        "FEATURE_YOUTUBE_UPLOAD": "0",
+        "FEATURE_AUTOPILOT": "0",
     }
 )
 
@@ -62,21 +69,15 @@ def test_auth() -> None:
     r = client.get("/api/budget", headers={"Authorization": "Bearer test-token-please-ignore"})
     check("budget is 200 and starts at zero", r.status_code == 200 and r.json().get("currentSpendInr") == 0, r.text[:200])
 
-    # WhatsApp queues approval and does not send
+    # Messaging endpoints were removed in the video-bot redesign.
     r = client.post(
         "/api/whatsapp/send",
         headers={"Authorization": "Bearer test-token-please-ignore"},
         json={"contact": "Rahul", "message": "hello test"},
     )
-    check("whatsapp queues approval", r.status_code == 200 and r.json().get("status") == "pending_approval", r.text)
-    approval_id = r.json().get("approval_id")
-    # Reject so we don't launch a browser
-    r = client.post(
-        "/api/approve",
-        headers={"Authorization": "Bearer test-token-please-ignore"},
-        json={"approval_id": approval_id, "approved": False},
-    )
-    check("reject approval", r.status_code == 200 and r.json().get("status") == "rejected", r.text)
+    check("whatsapp endpoint is gone", r.status_code == 404, str(r.status_code))
+    r = client.get("/api/status", headers={"Authorization": "Bearer test-token-please-ignore"})
+    check("status endpoint 200", r.status_code == 200 and r.json().get("phase") == 1, r.text[:200])
 
 
 async def test_vision_click() -> None:

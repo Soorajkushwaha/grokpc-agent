@@ -1,29 +1,17 @@
 import React, { createContext, useCallback, useContext, useEffect, useRef, useState, ReactNode } from 'react';
-import {
+import type {
   TabType,
   ConnectionConfig,
   OracleSystemHealth,
   BudgetMetrics,
   AgentLogEntry,
-  PendingApproval,
-  WhatsAppPayload,
-  GoogleVidsConfig,
+  Channel,
+  Job,
+  AgentStatus,
+  RuntimeSettings,
+  StyleProfile,
 } from '../types';
 import { apiFetch, isConfigured, loadConfig, novncIframeUrl, saveConfig, StoredConfig, withActive, wsUrl } from '../api';
-
-interface SimulatedDesktopState {
-  activeApp: 'chrome' | 'terminal' | 'vids' | 'files';
-  chromeUrl: string;
-  cursorPos: { x: number; y: number };
-  isClicking: boolean;
-  aiBoundingBox: { x: number; y: number; w: number; h: number; label: string } | null;
-  whatsAppStatus: 'qr-scan' | 'connected' | 'messaging' | 'sent';
-  gmailStatus: 'inbox' | 'reading' | 'drafting' | 'sent';
-  vidsStatus: 'idle' | 'generating-scenes' | 'tts-sync' | 'ffmpeg-merge' | 'saved-gdrive';
-  terminalLogs: string[];
-  lastActionText: string;
-  liveScreenshot?: string | null;
-}
 
 interface AppContextType {
   activeTab: TabType;
@@ -33,30 +21,35 @@ interface AppContextType {
   health: OracleSystemHealth;
   refreshHealth: () => Promise<void>;
   budget: BudgetMetrics;
-  recordCost: (costInr: number, tokensUsed?: number, isGemini?: boolean) => void;
+  status: AgentStatus | null;
+  channels: Channel[];
+  selectedChannelId: string;
+  setSelectedChannelId: (id: string) => void;
+  refreshChannels: () => Promise<void>;
+  saveChannel: (ch: Partial<Channel> & { id?: string; name: string }) => Promise<void>;
+  removeChannel: (id: string) => Promise<void>;
+  jobs: Job[];
+  refreshJobs: () => Promise<void>;
+  createVideoJob: (topic: string, idea?: string) => Promise<Job | null>;
+  pauseJob: (id: string) => Promise<void>;
+  resumeJob: (id: string) => Promise<void>;
+  cancelJob: (id: string) => Promise<void>;
+  approvePublish: (id: string) => Promise<void>;
   logs: AgentLogEntry[];
   addLog: (log: Omit<AgentLogEntry, 'id' | 'timestamp'>) => void;
   clearLogs: () => void;
-  pendingApproval: (PendingApproval & {
-    onApprove: (modifiedContent?: string) => void;
-    onReject: () => void;
-  }) | null;
-  setPendingApproval: (approval: AppContextType['pendingApproval']) => void;
-  isTakeoverModalOpen: boolean;
-  setIsTakeoverModalOpen: (open: boolean) => void;
-  isSettingsModalOpen: boolean;
-  setIsSettingsModalOpen: (open: boolean) => void;
+  showLogs: boolean;
+  setShowLogs: (v: boolean) => void;
   isAgentRunning: boolean;
   currentAgentTask: string;
   wsConnected: boolean;
   liveScreenshot: string | null;
   novncUrl: string;
-  simulatedDesktop: SimulatedDesktopState;
-  setSimulatedDesktop: React.Dispatch<React.SetStateAction<SimulatedDesktopState>>;
   runAgentPrompt: (promptText: string) => Promise<void>;
-  runWhatsAppFlow: (payload: WhatsAppPayload) => Promise<void>;
-  runGmailFlow: (subject: string, recipient: string, draftBody: string) => Promise<void>;
-  runGoogleVidsFlow: (vidsConfig: GoogleVidsConfig) => Promise<void>;
+  settings: RuntimeSettings | null;
+  saveSettings: (s: Partial<RuntimeSettings>) => Promise<void>;
+  styleProfile: StyleProfile | null;
+  saveStyle: (s: Partial<StyleProfile>) => Promise<void>;
 }
 
 const DEFAULT_HEALTH: OracleSystemHealth = {
@@ -82,13 +75,11 @@ const DEMO_HEALTH: OracleSystemHealth = {
   connected: true,
   lastPing: Date.now(),
   hostname: 'demo-mode',
-  os: 'Simulated Ubuntu 24.04',
-  architecture: 'aarch64 (demo)',
-  cpuUsagePercent: 14.8,
-  cpuCores: 4,
-  ramUsedGb: 3.4,
-  ramTotalGb: 12,
-  diskUsedGb: 36.4,
+  os: 'Simulated',
+  architecture: 'demo',
+  ramUsedGb: 2.1,
+  ramTotalGb: 6,
+  diskUsedGb: 20,
   diskTotalGb: 100,
   novncPortActive: true,
   fastapiPortActive: true,
@@ -104,12 +95,26 @@ const EMPTY_BUDGET: BudgetMetrics = {
   geminiCostInr: 0,
   oracleCloudCostInr: 0,
   hardLimitPauseEnabled: true,
+  videosToday: 0,
+  spendInrToday: 0,
+  dailyVideoCap: 3,
+  dailySpendCapInr: 40,
 };
+
+const DEMO_CHANNELS: Channel[] = [
+  { id: 'ch1', name: 'Channel 1', niche: '', language: 'Hindi', style: 'Practical, hook pehle', youtube_url: '', schedule: { days: ['mon', 'wed', 'fri'], time: '18:00' }, aspect: '16:9', enabled: true },
+  { id: 'ch2', name: 'Channel 2', niche: '', language: 'Hindi', style: 'Story-led', youtube_url: '', schedule: { days: ['tue', 'thu', 'sat'], time: '18:00' }, aspect: '16:9', enabled: true },
+  { id: 'ch3', name: 'Channel 3', niche: '', language: 'Hindi', style: 'Short, punchy', youtube_url: '', schedule: { days: ['sun', 'wed'], time: '19:00' }, aspect: '9:16', enabled: true },
+];
 
 const AppContext = createContext<AppContextType | null>(null);
 
 function toStored(c: ConnectionConfig): StoredConfig {
-  const backends = c.backends || { laptop: { backendUrl: '', agentToken: '', vncUrl: '' }, tablet: { backendUrl: '', agentToken: '', vncUrl: '' }, vps: { backendUrl: '', agentToken: '', vncUrl: '' } };
+  const backends = c.backends || {
+    laptop: { backendUrl: '', agentToken: '', vncUrl: '' },
+    tablet: { backendUrl: '', agentToken: '', vncUrl: '' },
+    vps: { backendUrl: '', agentToken: '', vncUrl: '' },
+  };
   const active = c.activeBackend || 'laptop';
   backends[active] = { backendUrl: c.backendUrl, agentToken: c.agentToken, vncUrl: c.vncUrl };
   return withActive({ activeBackend: active, backends, demoMode: c.demoMode });
@@ -117,7 +122,7 @@ function toStored(c: ConnectionConfig): StoredConfig {
 
 export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
   const stored = loadConfig();
-  const [activeTab, setActiveTab] = useState<TabType>('live-pc');
+  const [activeTab, setActiveTab] = useState<TabType>('home');
   const [config, setConfig] = useState<ConnectionConfig>(() => {
     const configured = isConfigured(stored);
     return {
@@ -131,28 +136,18 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   });
   const [health, setHealth] = useState<OracleSystemHealth>(config.demoMode ? DEMO_HEALTH : DEFAULT_HEALTH);
   const [budget, setBudget] = useState<BudgetMetrics>(EMPTY_BUDGET);
+  const [status, setStatus] = useState<AgentStatus | null>(null);
+  const [channels, setChannels] = useState<Channel[]>(DEMO_CHANNELS);
+  const [selectedChannelId, setSelectedChannelId] = useState('ch1');
+  const [jobs, setJobs] = useState<Job[]>([]);
   const [logs, setLogs] = useState<AgentLogEntry[]>([]);
-  const [pendingApproval, setPendingApproval] = useState<AppContextType['pendingApproval']>(null);
-  const [isTakeoverModalOpen, setIsTakeoverModalOpen] = useState(false);
-  const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
+  const [showLogs, setShowLogs] = useState(false);
   const [isAgentRunning, setIsAgentRunning] = useState(false);
   const [currentAgentTask, setCurrentAgentTask] = useState('');
   const [wsConnected, setWsConnected] = useState(false);
   const [liveScreenshot, setLiveScreenshot] = useState<string | null>(null);
-  const [simulatedDesktop, setSimulatedDesktop] = useState<SimulatedDesktopState>({
-    activeApp: 'chrome',
-    chromeUrl: 'https://web.whatsapp.com',
-    cursorPos: { x: 520, y: 340 },
-    isClicking: false,
-    aiBoundingBox: null,
-    whatsAppStatus: 'connected',
-    gmailStatus: 'inbox',
-    vidsStatus: 'idle',
-    terminalLogs: config.demoMode
-      ? ['[demo] Simulated desktop — turn off Demo mode after you paste the tunnel URL and token.']
-      : ['Waiting for live backend...'],
-    lastActionText: 'Idle',
-  });
+  const [settings, setSettings] = useState<RuntimeSettings | null>(null);
+  const [styleProfile, setStyleProfile] = useState<StyleProfile | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
   const configRef = useRef(config);
@@ -172,36 +167,27 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       const mime = (data as { screenshotMime?: string }).screenshotMime || 'image/png';
       setLiveScreenshot(`data:${mime};base64,${data.screenshotPngB64}`);
     }
-    if (data.pendingApproval && typeof data.pendingApproval === 'object') {
-      const p = data.pendingApproval as PendingApproval;
-      setPendingApproval({
-        ...p,
-        onApprove: (modified?: string) => void decideApproval(p.id, true, modified),
-        onReject: () => void decideApproval(p.id, false),
-      });
-    }
     const typ = (data.type as AgentLogEntry['type']) || 'system';
     addLog({
       type: typ,
       title: String(data.title || typ),
       message: String(data.message || ''),
       coords: data.coords as AgentLogEntry['coords'],
+      jobId: data.jobId as string | undefined,
+      step: data.step as string | undefined,
     });
-  }, [addLog]);
-
-  const decideApproval = async (approvalId: string, approved: boolean, modified?: string) => {
-    const cfg = configRef.current;
-    setPendingApproval(null);
-    if (cfg.demoMode || !isConfigured(cfg)) return;
-    try {
-      await apiFetch(toStored(cfg), '/api/approve', {
-        method: 'POST',
-        body: JSON.stringify({ approval_id: approvalId, approved, modified_content: modified || null }),
-      });
-    } catch (err) {
-      addLog({ type: 'error', title: 'Approval failed', message: String(err) });
+    if (data.jobId) {
+      // A job event — refresh shortly.
+      setTimeout(() => {
+        const cfg = configRef.current;
+        if (!cfg.demoMode && isConfigured(cfg)) {
+          void apiFetch<{ jobs: Job[] }>(toStored(cfg), '/api/jobs?limit=30')
+            .then((r) => setJobs(r.jobs || []))
+            .catch(() => undefined);
+        }
+      }, 400);
     }
-  };
+  }, [addLog]);
 
   const updateConfig = (updates: Partial<ConnectionConfig>) => {
     setConfig((prev) => {
@@ -242,28 +228,42 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     });
   };
 
-  const recordCost = (costInr: number, tokensUsed = 0, isGemini = false) => {
-    if (!config.demoMode) return;
-    setBudget((prev) => ({
-      ...prev,
-      currentSpendInr: Math.round((prev.currentSpendInr + costInr) * 100) / 100,
-      deepseekTokensUsed: isGemini ? prev.deepseekTokensUsed : prev.deepseekTokensUsed + tokensUsed,
-      deepseekCostInr: isGemini ? prev.deepseekCostInr : Math.round((prev.deepseekCostInr + costInr) * 100) / 100,
-      geminiCallsUsed: isGemini ? prev.geminiCallsUsed + 1 : prev.geminiCallsUsed,
-      geminiCostInr: isGemini ? Math.round((prev.geminiCostInr + costInr) * 100) / 100 : prev.geminiCostInr,
-    }));
-  };
-
   const clearLogs = () => setLogs([]);
 
-  const refreshHealth = async () => {
+  const refreshChannels = useCallback(async () => {
+    const cfg = configRef.current;
+    if (cfg.demoMode || !isConfigured(cfg)) {
+      setChannels(DEMO_CHANNELS);
+      return;
+    }
+    try {
+      const r = await apiFetch<{ channels: Channel[] }>(toStored(cfg), '/api/channels');
+      const list = r.channels || [];
+      setChannels(list);
+      setSelectedChannelId((prev) => (list.some((c) => c.id === prev) ? prev : list[0]?.id || ''));
+    } catch (err) {
+      addLog({ type: 'error', title: 'Channels', message: String(err) });
+    }
+  }, [addLog]);
+
+  const refreshJobs = useCallback(async () => {
+    const cfg = configRef.current;
+    if (cfg.demoMode || !isConfigured(cfg)) return;
+    try {
+      const r = await apiFetch<{ jobs: Job[] }>(toStored(cfg), '/api/jobs?limit=40');
+      setJobs(r.jobs || []);
+    } catch {
+      /* ignore transient */
+    }
+  }, []);
+
+  const refreshHealth = useCallback(async () => {
     const cfg = configRef.current;
     if (cfg.demoMode || !isConfigured(cfg)) {
       setHealth((prev) => ({
         ...DEMO_HEALTH,
         lastPing: Date.now(),
         connected: cfg.demoMode,
-        cpuUsagePercent: Math.round((12 + Math.random() * 10) * 10) / 10,
       }));
       return;
     }
@@ -272,13 +272,18 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       setHealth({ ...DEFAULT_HEALTH, ...data, connected: true, lastPing: Date.now() });
       const b = await apiFetch<BudgetMetrics>(toStored(cfg), '/api/budget');
       setBudget({ ...EMPTY_BUDGET, ...b });
+      const s = await apiFetch<AgentStatus>(toStored(cfg), '/api/status');
+      setStatus(s);
+      const st = await apiFetch<{ settings: RuntimeSettings }>(toStored(cfg), '/api/settings');
+      setSettings(st.settings);
+      const sp = await apiFetch<{ profile: StyleProfile }>(toStored(cfg), '/api/style-profile');
+      setStyleProfile(sp.profile);
     } catch (err) {
       setHealth((prev) => ({ ...prev, connected: false, lastPing: Date.now() }));
       addLog({ type: 'error', title: 'Backend unreachable', message: String(err) });
     }
-  };
+  }, [addLog]);
 
-  // WebSocket in live mode
   useEffect(() => {
     if (config.demoMode || !isConfigured(toStored(config))) {
       setWsConnected(false);
@@ -309,197 +314,87 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
   useEffect(() => {
     void refreshHealth();
+    void refreshChannels();
+    void refreshJobs();
     if (config.demoMode || !isConfigured(toStored(config))) return;
-    const t = setInterval(() => void refreshHealth(), 20000);
+    const t = setInterval(() => {
+      void refreshHealth();
+      void refreshJobs();
+    }, 8000);
     return () => clearInterval(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [config.backendUrl, config.agentToken, config.demoMode]);
+  }, [config.backendUrl, config.agentToken, config.demoMode, refreshHealth, refreshChannels, refreshJobs]);
 
-  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-  const runWhatsAppFlow = async (payload: WhatsAppPayload) => {
-    setIsAgentRunning(true);
-    setCurrentAgentTask(`WhatsApp → ${payload.contactNameOrNumber}`);
-    if (config.demoMode || !isConfigured(toStored(config))) {
-      addLog({ type: 'action', title: 'Demo WhatsApp', message: `Pretend-send to ${payload.contactNameOrNumber}` });
-      setPendingApproval({
-        id: `demo-wa-${Date.now()}`,
-        type: 'whatsapp',
-        title: 'Demo approval (not sent)',
-        recipient: payload.contactNameOrNumber,
-        previewContent: payload.messageText,
-        createdAt: new Date().toLocaleTimeString(),
-        onApprove: async () => {
-          setPendingApproval(null);
-          addLog({ type: 'action', title: 'Demo sent', message: payload.messageText });
-          setIsAgentRunning(false);
-          setCurrentAgentTask('');
-        },
-        onReject: () => {
-          setPendingApproval(null);
-          setIsAgentRunning(false);
-          setCurrentAgentTask('');
-        },
-      });
-      return;
+  const createVideoJob = async (topic: string, idea = ''): Promise<Job | null> => {
+    const trimmed = topic.trim();
+    if (!trimmed) return null;
+    const cfg = configRef.current;
+    if (cfg.demoMode || !isConfigured(cfg)) {
+      const demo: Job = {
+        id: `demo-${Date.now()}`,
+        channel_id: selectedChannelId,
+        topic: trimmed,
+        idea,
+        status: 'completed',
+        current_step: 'edit',
+        plan: { title: trimmed, voiceover_script: trimmed, story: 'Demo plan — backend connect karo to real video banegi.' },
+        final_path: '(demo — koi file nahi bani)',
+        steps: [
+          { name: 'story', status: 'success', detail: 'demo' },
+          { name: 'voiceover', status: 'success', detail: 'demo' },
+          { name: 'edit', status: 'success', detail: 'demo' },
+        ],
+        created_at: new Date().toISOString(),
+      };
+      setJobs((prev) => [demo, ...prev]);
+      addLog({ type: 'system', title: 'Demo job', message: 'Settings me Laptop URL + token daalo, tab asli video banegi.' });
+      setActiveTab('jobs');
+      return demo;
     }
     try {
-      const res = await apiFetch<{ status: string; approval_id: string; approval: PendingApproval }>(
-        toStored(config),
-        '/api/whatsapp/send',
-        { method: 'POST', body: JSON.stringify({ contact: payload.contactNameOrNumber, message: payload.messageText, attachment_path: payload.attachmentPath || '' }) },
-      );
-      addLog({ type: 'approval', title: 'Waiting for approval', message: `WhatsApp to ${payload.contactNameOrNumber}` });
-      if (res.approval) {
-        const p = res.approval;
-        setPendingApproval({
-          ...p,
-          onApprove: (modified?: string) => {
-            setPendingApproval(null);
-            void decideApproval(p.id || res.approval_id, true, modified);
-            setIsAgentRunning(false);
-            setCurrentAgentTask('');
-          },
-          onReject: () => {
-            setPendingApproval(null);
-            void decideApproval(p.id || res.approval_id, false);
-            setIsAgentRunning(false);
-            setCurrentAgentTask('');
-          },
-        });
-      }
-    } catch (err) {
-      addLog({ type: 'error', title: 'WhatsApp request failed', message: String(err) });
-      setIsAgentRunning(false);
-      setCurrentAgentTask('');
-    }
-  };
-
-  const runGmailFlow = async (subject: string, recipient: string, draftBody: string) => {
-    setIsAgentRunning(true);
-    setCurrentAgentTask(`Gmail → ${recipient}`);
-    if (config.demoMode || !isConfigured(toStored(config))) {
-      setPendingApproval({
-        id: `demo-gm-${Date.now()}`,
-        type: 'gmail',
-        title: 'Demo Gmail (not sent)',
-        recipient,
-        previewContent: draftBody,
-        createdAt: new Date().toLocaleTimeString(),
-        onApprove: () => {
-          setPendingApproval(null);
-          addLog({ type: 'action', title: 'Demo email', message: subject });
-          setIsAgentRunning(false);
-          setCurrentAgentTask('');
-        },
-        onReject: () => {
-          setPendingApproval(null);
-          setIsAgentRunning(false);
-          setCurrentAgentTask('');
-        },
-      });
-      return;
-    }
-    try {
-      const res = await apiFetch<{ approval_id: string; approval: PendingApproval }>(
-        toStored(config),
-        '/api/gmail/send',
-        { method: 'POST', body: JSON.stringify({ recipient, subject, body: draftBody }) },
-      );
-      const p = res.approval;
-      if (p) {
-        setPendingApproval({
-          ...p,
-          onApprove: (modified?: string) => {
-            setPendingApproval(null);
-            void decideApproval(p.id || res.approval_id, true, modified);
-            setIsAgentRunning(false);
-            setCurrentAgentTask('');
-          },
-          onReject: () => {
-            setPendingApproval(null);
-            void decideApproval(p.id || res.approval_id, false);
-            setIsAgentRunning(false);
-            setCurrentAgentTask('');
-          },
-        });
-      }
-    } catch (err) {
-      addLog({ type: 'error', title: 'Gmail request failed', message: String(err) });
-      setIsAgentRunning(false);
-      setCurrentAgentTask('');
-    }
-  };
-
-  const runGoogleVidsFlow = async (vidsConfig: GoogleVidsConfig) => {
-    setIsAgentRunning(true);
-    setCurrentAgentTask(`Video: ${vidsConfig.topic}`);
-    if (config.demoMode || !isConfigured(toStored(config))) {
-      addLog({ type: 'terminal', title: 'Demo FFmpeg', message: 'No real file is created in Demo mode.' });
-      await sleep(800);
-      setIsAgentRunning(false);
-      setCurrentAgentTask('');
-      return;
-    }
-    try {
-      await apiFetch(toStored(config), '/api/video/generate', {
+      const r = await apiFetch<{ job: Job }>(toStored(cfg), '/api/jobs', {
         method: 'POST',
-        body: JSON.stringify({
-          topic: vidsConfig.topic,
-          script: vidsConfig.scriptText,
-          language: vidsConfig.language,
-          duration_seconds: vidsConfig.durationSeconds,
-          use_google_vids: false,
-        }),
+        body: JSON.stringify({ channel_id: selectedChannelId, topic: trimmed, idea }),
       });
-      addLog({ type: 'system', title: 'Video started', message: 'FFmpeg + gTTS pipeline running on the VM.' });
+      addLog({ type: 'system', title: 'Nayi video', message: trimmed });
+      await refreshJobs();
+      setActiveTab('jobs');
+      return r.job;
     } catch (err) {
-      addLog({ type: 'error', title: 'Video failed', message: String(err) });
-    } finally {
-      setIsAgentRunning(false);
-      setCurrentAgentTask('');
+      addLog({ type: 'error', title: 'Job nahi bani', message: String(err) });
+      return null;
+    }
+  };
+
+  const jobAction = async (id: string, path: string, title: string) => {
+    const cfg = configRef.current;
+    if (cfg.demoMode || !isConfigured(cfg)) {
+      if (path.endsWith('/cancel')) {
+        setJobs((prev) => prev.map((j) => (j.id === id ? { ...j, status: 'cancelled' } : j)));
+      }
+      return;
+    }
+    try {
+      await apiFetch(toStored(cfg), path, { method: 'POST' });
+      addLog({ type: 'system', title, message: id });
+      await refreshJobs();
+    } catch (err) {
+      addLog({ type: 'error', title, message: String(err) });
     }
   };
 
   const runAgentPrompt = async (promptText: string) => {
     if (!promptText.trim()) return;
-    const lower = promptText.toLowerCase();
-    if (lower.includes('whatsapp') || lower.startsWith('wa ')) {
-      await runWhatsAppFlow({
-        contactNameOrNumber: 'contact',
-        messageText: promptText,
-      });
-      return;
-    }
-    if (lower.includes('video') || lower.includes('ffmpeg') || lower.includes('vids')) {
-      await runGoogleVidsFlow({
-        topic: promptText,
-        aspectRatio: '16:9',
-        durationSeconds: 15,
-        visualStyle: 'Tech Explainer',
-        voiceActor: 'Aarav (Hindi Energetic)',
-        language: 'Hindi',
-        speechRate: 1,
-        voicePitch: 1,
-        scriptText: promptText,
-        burnSubtitles: false,
-        saveToGdrive: true,
-        destinationFolder: '/mnt/gdrive/Vids_Automation',
-      });
-      return;
-    }
     setIsAgentRunning(true);
     setCurrentAgentTask(promptText);
-    if (config.demoMode || !isConfigured(toStored(config))) {
+    const cfg = configRef.current;
+    if (cfg.demoMode || !isConfigured(cfg)) {
       addLog({ type: 'action', title: 'Demo prompt', message: promptText });
-      await sleep(600);
-      addLog({ type: 'system', title: 'Demo only', message: 'Connect a backend (Settings) to run this on your Oracle VM.' });
       setIsAgentRunning(false);
       setCurrentAgentTask('');
       return;
     }
     try {
-      await apiFetch(toStored(config), '/api/task', {
+      await apiFetch(toStored(cfg), '/api/task', {
         method: 'POST',
         body: JSON.stringify({ prompt: promptText }),
       });
@@ -509,6 +404,87 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       setCurrentAgentTask('');
     }
   };
+
+  const saveChannel = async (ch: Partial<Channel> & { id?: string; name: string }) => {
+    const cfg = configRef.current;
+    if (cfg.demoMode || !isConfigured(cfg)) {
+      if (ch.id) {
+        setChannels((prev) => prev.map((c) => (c.id === ch.id ? { ...c, ...ch } as Channel : c)));
+      } else {
+        const id = `ch-demo-${Date.now()}`;
+        setChannels((prev) => [...prev, { id, niche: '', language: 'Hindi', style: '', youtube_url: '', schedule: { days: ['mon'], time: '18:00' }, aspect: '16:9', enabled: true, ...ch, name: ch.name }]);
+      }
+      return;
+    }
+    try {
+      if (ch.id && channels.some((c) => c.id === ch.id)) {
+        await apiFetch(toStored(cfg), `/api/channels/${ch.id}`, { method: 'PUT', body: JSON.stringify(ch) });
+      } else {
+        await apiFetch(toStored(cfg), '/api/channels', { method: 'POST', body: JSON.stringify(ch) });
+      }
+      await refreshChannels();
+    } catch (err) {
+      addLog({ type: 'error', title: 'Channel', message: String(err) });
+    }
+  };
+
+  const removeChannel = async (id: string) => {
+    const cfg = configRef.current;
+    if (cfg.demoMode || !isConfigured(cfg)) {
+      setChannels((prev) => prev.filter((c) => c.id !== id));
+      return;
+    }
+    try {
+      await apiFetch(toStored(cfg), `/api/channels/${id}`, { method: 'DELETE' });
+      await refreshChannels();
+    } catch (err) {
+      addLog({ type: 'error', title: 'Channel delete', message: String(err) });
+    }
+  };
+
+  const saveSettingsFn = async (s: Partial<RuntimeSettings>) => {
+    const cfg = configRef.current;
+    if (cfg.demoMode || !isConfigured(cfg)) {
+      setSettings((prev) => ({ ...(prev || { quiet_hours: '23:00-07:00', idle_seconds: 900, daily_video_cap: 3, daily_spend_cap_inr: 40, autopilot_enabled: false }), ...s }));
+      return;
+    }
+    try {
+      const r = await apiFetch<{ settings: RuntimeSettings }>(toStored(cfg), '/api/settings', {
+        method: 'PUT',
+        body: JSON.stringify(s),
+      });
+      setSettings(r.settings);
+    } catch (err) {
+      addLog({ type: 'error', title: 'Settings', message: String(err) });
+    }
+  };
+
+  const saveStyleFn = async (s: Partial<StyleProfile>) => {
+    const cfg = configRef.current;
+    if (cfg.demoMode || !isConfigured(cfg)) {
+      setStyleProfile((prev) => ({ ...(prev as StyleProfile), ...s } as StyleProfile));
+      return;
+    }
+    try {
+      const r = await apiFetch<{ profile: StyleProfile }>(toStored(cfg), '/api/style-profile', {
+        method: 'PUT',
+        body: JSON.stringify(s),
+      });
+      setStyleProfile(r.profile);
+    } catch (err) {
+      addLog({ type: 'error', title: 'Style', message: String(err) });
+    }
+  };
+
+  // Clear "agent running" when a finished log arrives after some time
+  useEffect(() => {
+    if (!isAgentRunning) return;
+    const last = logs[0];
+    if (last && (last.title === 'Agent finished' || last.title === 'Task failed')) {
+      setIsAgentRunning(false);
+      setCurrentAgentTask('');
+    }
+  }, [logs, isAgentRunning]);
 
   return (
     <AppContext.Provider
@@ -520,27 +496,35 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         health,
         refreshHealth,
         budget,
-        recordCost,
+        status,
+        channels,
+        selectedChannelId,
+        setSelectedChannelId,
+        refreshChannels,
+        saveChannel,
+        removeChannel,
+        jobs,
+        refreshJobs,
+        createVideoJob,
+        pauseJob: (id) => jobAction(id, `/api/jobs/${id}/pause`, 'Paused'),
+        resumeJob: (id) => jobAction(id, `/api/jobs/${id}/resume`, 'Resumed'),
+        cancelJob: (id) => jobAction(id, `/api/jobs/${id}/cancel`, 'Cancelled'),
+        approvePublish: (id) => jobAction(id, `/api/jobs/${id}/approve-publish`, 'Publish'),
         logs,
         addLog,
         clearLogs,
-        pendingApproval,
-        setPendingApproval,
-        isTakeoverModalOpen,
-        setIsTakeoverModalOpen,
-        isSettingsModalOpen,
-        setIsSettingsModalOpen,
+        showLogs,
+        setShowLogs,
         isAgentRunning,
         currentAgentTask,
         wsConnected,
         liveScreenshot,
         novncUrl: novncIframeUrl(toStored(config)),
-        simulatedDesktop,
-        setSimulatedDesktop,
         runAgentPrompt,
-        runWhatsAppFlow,
-        runGmailFlow,
-        runGoogleVidsFlow,
+        settings,
+        saveSettings: saveSettingsFn,
+        styleProfile,
+        saveStyle: saveStyleFn,
       }}
     >
       {children}

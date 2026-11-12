@@ -30,3 +30,6 @@ outputs/
 .DS_Store
 .idea/
 .vscode/
+
+# Windows helper local token
+**/helper.env

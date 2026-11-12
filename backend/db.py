@@ -61,6 +61,9 @@ def init_db() -> None:
             cur.execute(f"ALTER TABLE task_logs ADD COLUMN {name} {decl}")
     conn.commit()
     conn.close()
+    # Video-job tables live in jobs.py so a Phase 1 deploy just adds tables.
+    from jobs import init_tables
+    init_tables()
 
 
 def estimate_cost_usd(provider: str, tokens_in: int, tokens_out: int, kind: str = "chat") -> float:
@@ -147,4 +150,45 @@ def budget_summary() -> dict[str, Any]:
         "oracleCloudCostInr": 0.0,
         "hardLimitPauseEnabled": True,
         "overBudget": cost_inr >= MONTHLY_CAP_INR,
+    }
+
+
+def today_stats() -> dict[str, Any]:
+    """Videos finished today + INR spent today (task_logs + jobs)."""
+    conn = connect()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT COALESCE(SUM(cost_inr), 0)
+        FROM task_logs
+        WHERE date(created_at) = date('now', 'localtime')
+        """
+    )
+    spend = float(cur.fetchone()[0] or 0)
+    videos = 0
+    try:
+        cur.execute(
+            """
+            SELECT COUNT(*) FROM jobs
+            WHERE status = 'completed'
+              AND date(updated_at) = date('now', 'localtime')
+            """
+        )
+        videos = int(cur.fetchone()[0] or 0)
+    except sqlite3.OperationalError:
+        videos = 0
+    queued = running = 0
+    try:
+        cur.execute("SELECT status, COUNT(*) FROM jobs GROUP BY status")
+        counts = {row[0]: row[1] for row in cur.fetchall()}
+        queued = int(counts.get("queued") or 0)
+        running = int(counts.get("running") or 0)
+    except sqlite3.OperationalError:
+        pass
+    conn.close()
+    return {
+        "videosToday": videos,
+        "spendInrToday": round(spend, 2),
+        "jobsQueued": queued,
+        "jobsRunning": running,
     }

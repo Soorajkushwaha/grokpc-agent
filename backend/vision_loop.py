@@ -236,6 +236,7 @@ def _normalize_key(key: str) -> str:
 
 
 async def apply_action(page, action: dict[str, Any]) -> str:
+    """Apply one model action. `page` may be a Playwright Page or a Driver."""
     try:
         return await _apply_action(page, action)
     except Exception as exc:  # let the model see the error and try something else
@@ -244,35 +245,29 @@ async def apply_action(page, action: dict[str, Any]) -> str:
 
 
 async def _apply_action(page, action: dict[str, Any]) -> str:
+    from drivers import as_driver
+
+    driver = as_driver(page)
     kind = (action.get("action") or "done").lower().strip()
     if kind == "goto":
-        url = (action.get("url") or "").strip()
-        if url and "://" not in url and not url.startswith("about:"):
-            url = "https://" + url
-        await page.goto(url, wait_until="domcontentloaded")
-        return f"Navigated to {url}"
+        return await driver.goto(action.get("url") or "")
     if kind == "click":
         x, y = int(action.get("x") or 0), int(action.get("y") or 0)
-        await page.mouse.click(x, y)
-        return f"Clicked ({x},{y})"
+        return await driver.click(x, y)
     if kind == "type":
-        text = action.get("text") or ""
-        await page.keyboard.type(text, delay=20)
-        return f"Typed {len(text)} chars"
+        return await driver.type_text(action.get("text") or "")
     if kind == "press":
         key = _normalize_key(action.get("key") or "Enter")
-        await page.keyboard.press(key)
-        return f"Pressed {key}"
+        return await driver.press(key)
     if kind == "scroll":
         amount = int(action.get("amount") or 400)
-        await page.mouse.wheel(0, amount)
-        return f"Scrolled {amount}px"
+        return await driver.scroll(amount)
     if kind == "wait":
-        import asyncio
-
         ms = int(action.get("amount") or 1000)
-        await asyncio.sleep(ms / 1000)
-        return f"Waited {ms}ms"
+        return await driver.wait(ms)
+    if kind == "launch":
+        app = action.get("text") or action.get("url") or action.get("app") or ""
+        return await driver.launch(app)
     if kind == "done":
         return action.get("text") or action.get("thought") or "Done"
     return f"Unknown action {kind}"
@@ -280,12 +275,22 @@ async def _apply_action(page, action: dict[str, Any]) -> str:
 
 
 async def _capture_screenshot(page) -> tuple[bytes, str]:
-    fmt = (SCREENSHOT_FORMAT or "png").lower()
-    if fmt in {"jpg", "jpeg"}:
-        data = await page.screenshot(type="jpeg", quality=max(1, min(SCREENSHOT_QUALITY, 100)), full_page=False)
-        return data, "image/jpeg"
-    data = await page.screenshot(type="png", full_page=False)
-    return data, "image/png"
+    from drivers import as_driver
+
+    driver = as_driver(page)
+    return await driver.screenshot()
+
+
+def _driver_system_note(kind: str) -> str:
+    if kind == "windows":
+        return (
+            "You are driving a Windows desktop (not a browser tab). "
+            "Coordinates are screen pixels from the top-left. "
+            "Use click/type/press/scroll/launch/wait. "
+            "'goto' is not available. 'launch' opens an installed app (e.g. capcut). "
+            "Key names: Enter, Tab, Control+i, Alt+F4, Control+s."
+        )
+    return ""
 
 
 async def run_vision_task(
@@ -297,15 +302,23 @@ async def run_vision_task(
     max_steps: Optional[int] = None,
 ) -> dict[str, Any]:
     import asyncio
+    from drivers import as_driver
 
+    driver = as_driver(page)
     steps = max_steps or MAX_VISION_STEPS
     history: list[dict[str, Any]] = []
     last_result = ""
+    extra = _driver_system_note(getattr(driver, "kind", "browser"))
     for step in range(1, steps + 1):
-        image, mime = await _capture_screenshot(page)
+        image, mime = await driver.screenshot()
+        try:
+            url = await driver.current_url()
+        except Exception:
+            url = ""
         prompt = (
             f"Task: {task}\n"
-            f"Step {step}/{steps}. URL: {page.url}\n"
+            f"Step {step}/{steps}. Surface: {getattr(driver, 'kind', 'browser')} URL: {url}\n"
+            f"{extra}\n"
             f"Last result: {last_result or 'none'}\n"
             "Decide the next single action."
         )
