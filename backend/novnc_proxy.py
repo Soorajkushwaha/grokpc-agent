@@ -47,8 +47,9 @@ async def novnc_root(request: Request):
 
 @router.api_route("/novnc/{path:path}", methods=["GET", "HEAD"], include_in_schema=False)
 async def novnc_http(request: Request, path: str):
-    if not tokens_match(token_from_request(request)):
-        return Response("Unauthorized", status_code=401)
+    # Static noVNC files (html/js/css/images) are public and harmless; relative
+    # asset requests carry no token. The desktop itself (websockify) stays
+    # token-protected below.
     if path.rstrip("/").endswith("websockify"):
         return Response("Use WebSocket", status_code=426)
     url = _http_url(path, str(request.query_params))
