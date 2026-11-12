@@ -962,6 +962,10 @@ async def api_approve_publish(job_id: str, _auth: str = Depends(require_auth)):
 # ---------------------------------------------------------------------------
 
 
+class OpenUrlRequest(BaseModel):
+    url: str
+
+
 class TaskRequest(BaseModel):
     prompt: str
 
@@ -973,6 +977,19 @@ class VideoRequest(BaseModel):
     duration_seconds: int = 15
     use_google_vids: bool = False
     channel_id: str = ""
+
+
+@app.post("/api/browser/open")
+async def api_open_url(req: OpenUrlRequest, _auth: str = Depends(require_auth)):
+    """Open a URL in the visible persistent Chrome profile. No typing, no clicks."""
+    if agent is None:
+        raise HTTPException(status_code=503, detail="Agent is not ready")
+    url = (req.url or "").strip()
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="url must start with http:// or https://")
+    if len(url) > 2000:
+        raise HTTPException(status_code=400, detail="url too long")
+    return await agent.open_visible_url(url)
 
 
 @app.post("/api/task")
@@ -1219,6 +1236,30 @@ class BrowserAgentCore:
                         await page.close()
                     except Exception:
                         pass
+                self.is_busy = False
+
+    async def open_visible_url(self, url: str) -> dict[str, Any]:
+        """Open a URL in the persistent visible Chrome profile. Does not type or click.
+
+        Leaves the tab open so the user can log in over noVNC. Reuses the
+        already-launched context when the agent holds the profile lock.
+        """
+        async with self._lock:
+            self.is_busy = True
+            try:
+                await self.initialize_browser(headless=False)
+                if self.context is None:
+                    raise RuntimeError("browser context was not created")
+                page = await self.context.new_page()
+                try:
+                    await page.set_viewport_size({"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT})
+                except Exception:
+                    pass
+                await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+                self.page = page
+                await self.emit("system", "Opened URL", page.url)
+                return {"ok": True, "url": page.url, "title": await page.title()}
+            finally:
                 self.is_busy = False
 
     async def run_generic_task(self, task: str, mock: Optional[MockLLM] = None) -> dict[str, Any]:

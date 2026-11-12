@@ -1,6 +1,36 @@
-import React, { useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { useApp } from '../context/AppContext';
-import { Send, ChevronDown, Monitor, KeyRound, ScrollText, WifiOff } from 'lucide-react';
+import { novncIframeUrl, type NovncQuality } from '../api';
+import { Send, ChevronDown, Monitor, KeyRound, ScrollText, WifiOff, Maximize2 } from 'lucide-react';
+
+
+const SCREEN_PREFS_KEY = 'grokpc_screen_prefs_v1';
+
+type ScreenPrefs = { viewOnly: boolean; quality: NovncQuality };
+
+const DEFAULT_PREFS: ScreenPrefs = { viewOnly: false, quality: 'fast' };
+
+function loadScreenPrefs(): ScreenPrefs {
+  try {
+    const raw = localStorage.getItem(SCREEN_PREFS_KEY);
+    if (!raw) return { ...DEFAULT_PREFS };
+    const parsed = JSON.parse(raw) as Partial<ScreenPrefs>;
+    return {
+      viewOnly: Boolean(parsed.viewOnly),
+      quality: parsed.quality === 'clear' ? 'clear' : 'fast',
+    };
+  } catch {
+    return { ...DEFAULT_PREFS };
+  }
+}
+
+function saveScreenPrefs(prefs: ScreenPrefs): void {
+  try {
+    localStorage.setItem(SCREEN_PREFS_KEY, JSON.stringify(prefs));
+  } catch {
+    /* ignore quota / private mode */
+  }
+}
 
 const LOGIN_SITES = [
   { name: 'ChatGPT', url: 'chatgpt.com', why: 'Story / prompt plan' },
@@ -13,7 +43,6 @@ const LOGIN_SITES = [
 
 export const LiveScreen: React.FC = () => {
   const {
-    novncUrl,
     config,
     health,
     liveScreenshot,
@@ -28,7 +57,33 @@ export const LiveScreen: React.FC = () => {
   } = useApp();
   const [prompt, setPrompt] = useState('');
   const [loginsOpen, setLoginsOpen] = useState(false);
+  const [prefs, setPrefs] = useState<ScreenPrefs>(DEFAULT_PREFS);
   const connected = !config.demoMode && health.connected;
+
+  useEffect(() => {
+    setPrefs(loadScreenPrefs());
+  }, []);
+
+  const setViewOnly = (viewOnly: boolean) => {
+    setPrefs((prev) => {
+      const next = { ...prev, viewOnly };
+      saveScreenPrefs(next);
+      return next;
+    });
+  };
+
+  const setQuality = (quality: NovncQuality) => {
+    setPrefs((prev) => {
+      const next = { ...prev, quality };
+      saveScreenPrefs(next);
+      return next;
+    });
+  };
+
+  const frameUrl = useMemo(
+    () => novncIframeUrl(config, { viewOnly: prefs.viewOnly, quality: prefs.quality }),
+    [config, prefs.viewOnly, prefs.quality],
+  );
 
   const send = async () => {
     const t = prompt.trim();
@@ -37,7 +92,7 @@ export const LiveScreen: React.FC = () => {
     await runAgentPrompt(t);
   };
 
-  const hasView = (connected && novncUrl) || liveScreenshot;
+  const hasView = (connected && frameUrl) || liveScreenshot;
 
   return (
     <div className="space-y-3">
@@ -49,24 +104,88 @@ export const LiveScreen: React.FC = () => {
           </div>
           <span
             className={`inline-flex items-center gap-1.5 text-[10px] font-semibold px-2 py-0.5 rounded-full border ${
-              connected && novncUrl
+              connected && frameUrl
                 ? 'text-emerald-300 bg-emerald-950/60 border-emerald-700/40'
                 : 'text-slate-400 bg-slate-900 border-slate-700/60'
             }`}
           >
             <span
               className={`w-1.5 h-1.5 rounded-full ${
-                connected && novncUrl ? 'bg-emerald-400 live-dot' : 'bg-slate-500'
+                connected && frameUrl ? 'bg-emerald-400 live-dot' : 'bg-slate-500'
               }`}
             />
-            {connected && novncUrl ? 'Connected' : config.demoMode ? 'Demo' : 'Offline'}
+            {connected && frameUrl ? 'Connected' : config.demoMode ? 'Demo' : 'Offline'}
           </span>
         </div>
+        {connected && frameUrl && (
+          <div className="flex flex-wrap items-center gap-1.5 px-3 py-2 border-b border-white/5 bg-slate-950/70">
+            <div className="flex p-0.5 bg-slate-900/80 border border-white/8 rounded-xl">
+              <button
+                type="button"
+                onClick={() => setViewOnly(true)}
+                className={`px-2.5 py-1.5 rounded-lg text-[11px] font-semibold cursor-pointer min-h-[36px] transition-colors ${
+                  prefs.viewOnly
+                    ? 'bg-cyan-600 text-white shadow-md shadow-cyan-900/30'
+                    : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                👀 Sirf dekho
+              </button>
+              <button
+                type="button"
+                onClick={() => setViewOnly(false)}
+                className={`px-2.5 py-1.5 rounded-lg text-[11px] font-semibold cursor-pointer min-h-[36px] transition-colors ${
+                  !prefs.viewOnly
+                    ? 'bg-cyan-600 text-white shadow-md shadow-cyan-900/30'
+                    : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                🖐️ Control lo
+              </button>
+            </div>
+            <div className="flex items-center gap-1">
+              <span className="text-[10px] font-semibold text-slate-500 pl-0.5">Quality</span>
+            <div className="flex p-0.5 bg-slate-900/80 border border-white/8 rounded-xl">
+              <button
+                type="button"
+                onClick={() => setQuality('fast')}
+                className={`px-2.5 py-1.5 rounded-lg text-[11px] font-semibold cursor-pointer min-h-[36px] transition-colors ${
+                  prefs.quality === 'fast'
+                    ? 'bg-cyan-600 text-white shadow-md shadow-cyan-900/30'
+                    : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                Fast
+              </button>
+              <button
+                type="button"
+                onClick={() => setQuality('clear')}
+                className={`px-2.5 py-1.5 rounded-lg text-[11px] font-semibold cursor-pointer min-h-[36px] transition-colors ${
+                  prefs.quality === 'clear'
+                    ? 'bg-cyan-600 text-white shadow-md shadow-cyan-900/30'
+                    : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                Clear
+              </button>
+            </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => window.open(frameUrl, '_blank', 'noopener,noreferrer')}
+              className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-xl text-[11px] font-semibold cursor-pointer min-h-[36px] bg-slate-900/80 border border-white/8 text-slate-300 hover:text-white hover:border-white/15 transition-colors"
+            >
+              <Maximize2 className="w-3.5 h-3.5" />
+              Full screen / naya tab
+            </button>
+          </div>
+        )}
         <div className="relative aspect-video bg-[#05080f]">
-          {connected && novncUrl ? (
+          {connected && frameUrl ? (
             <iframe
+              key={frameUrl}
               title="Live desktop"
-              src={novncUrl}
+              src={frameUrl}
               className="w-full h-full border-0 bg-black"
               allow="clipboard-read; clipboard-write"
             />

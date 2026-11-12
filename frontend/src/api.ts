@@ -142,17 +142,32 @@ export function wsUrl(base: string, token: string): string {
   return u.toString();
 }
 
-export function novncIframeUrl(cfg: StoredConfig): string {
+export type NovncQuality = 'fast' | 'clear';
+
+export interface NovncViewOpts {
+  viewOnly?: boolean;
+  quality?: NovncQuality;
+}
+
+/** Build the noVNC iframe/tab URL. Default is Fast (quality=2, compression=9) + Control. */
+export function novncIframeUrl(
+  cfg: Pick<StoredConfig, 'backendUrl' | 'agentToken' | 'vncUrl'>,
+  opts: NovncViewOpts = {},
+): string {
   // Prefer the token-protected backend proxy: no separate VNC password needed.
+  const quality = opts.quality === 'clear' ? 6 : 2;
+  const compression = opts.quality === 'clear' ? 2 : 9;
+  const viewOnly = opts.viewOnly ? 1 : 0;
+  const extra = `autoconnect=1&reconnect=1&resize=scale&quality=${quality}&compression=${compression}&show_dot=1&view_only=${viewOnly}`;
   if (cfg.backendUrl && cfg.agentToken) {
     const t = encodeURIComponent(cfg.agentToken);
     const wsPath = encodeURIComponent(`novnc/websockify?token=${cfg.agentToken}`);
-    return `${joinUrl(cfg.backendUrl, '/novnc/vnc.html')}?token=${t}&autoconnect=1&reconnect=1&resize=scale&path=${wsPath}`;
+    return `${joinUrl(cfg.backendUrl, '/novnc/vnc.html')}?token=${t}&${extra}&path=${wsPath}`;
   }
   if (cfg.vncUrl) {
     const raw = cfg.vncUrl.trim();
     const sep = raw.includes('?') ? '&' : '?';
-    return `${raw}${sep}autoconnect=1&resize=scale`;
+    return `${raw}${sep}${extra}`;
   }
   return '';
 }

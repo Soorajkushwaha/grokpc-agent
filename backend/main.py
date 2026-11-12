@@ -509,6 +509,10 @@ async def api_approve_publish(job_id: str, _auth: str = Depends(require_auth)):
 # ---------------------------------------------------------------------------
 
 
+class OpenUrlRequest(BaseModel):
+    url: str
+
+
 class TaskRequest(BaseModel):
     prompt: str
 
@@ -520,6 +524,19 @@ class VideoRequest(BaseModel):
     duration_seconds: int = 15
     use_google_vids: bool = False
     channel_id: str = ""
+
+
+@app.post("/api/browser/open")
+async def api_open_url(req: OpenUrlRequest, _auth: str = Depends(require_auth)):
+    """Open a URL in the visible persistent Chrome profile. No typing, no clicks."""
+    if agent is None:
+        raise HTTPException(status_code=503, detail="Agent is not ready")
+    url = (req.url or "").strip()
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="url must start with http:// or https://")
+    if len(url) > 2000:
+        raise HTTPException(status_code=400, detail="url too long")
+    return await agent.open_visible_url(url)
 
 
 @app.post("/api/task")
