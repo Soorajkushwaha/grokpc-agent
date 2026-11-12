@@ -7,13 +7,20 @@ import os
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 
-from playwright.async_api import BrowserContext, Page, async_playwright
-
 from config import (
     ANDROID, CDP_URL, CHROME_PROFILE_DIR, CHROMIUM_PATH, DRY_RUN, HEADLESS,
     LOW_MEMORY, VIEWPORT_HEIGHT, VIEWPORT_WIDTH,
 )
 from vision_loop import MockLLM, run_vision_task
+
+try:
+    from playwright.async_api import BrowserContext, Page, async_playwright  # type: ignore
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:  # tablet / Termux worker has no Playwright
+    BrowserContext = Any  # type: ignore[misc,assignment]
+    Page = Any  # type: ignore[misc,assignment]
+    async_playwright = None  # type: ignore[assignment]
+    PLAYWRIGHT_AVAILABLE = False
 
 logger = logging.getLogger("grokpc.agent")
 
@@ -39,6 +46,12 @@ class BrowserAgentCore:
     async def initialize_browser(self, headless: Optional[bool] = None) -> BrowserContext:
         if self.context:
             return self.context
+        if not PLAYWRIGHT_AVAILABLE or async_playwright is None:
+            raise RuntimeError(
+                "Playwright is not installed on this worker. "
+                "Browser visuals and /api/task are unavailable; "
+                "the video pipeline still runs with Gemini/gTTS/FFmpeg fallback visuals."
+            )
         os.makedirs(CHROME_PROFILE_DIR, exist_ok=True)
         await self.emit("system", "Launching browser", f"Profile {CHROME_PROFILE_DIR}")
         self.playwright = await async_playwright().start()

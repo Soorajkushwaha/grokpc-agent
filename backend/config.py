@@ -6,10 +6,13 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-# Load /app/agent/.env when present, else a local .env next to this file.
+# Load GROKPC_ENV if set, else /app/agent/.env, else a local .env next to this file.
+_ENV_OVERRIDE = Path(os.getenv("GROKPC_ENV", "").strip()) if os.getenv("GROKPC_ENV", "").strip() else None
 _DEFAULT_ENV = Path("/app/agent/.env")
 _LOCAL_ENV = Path(__file__).resolve().parent / ".env"
-if _DEFAULT_ENV.is_file():
+if _ENV_OVERRIDE and _ENV_OVERRIDE.is_file():
+    load_dotenv(_ENV_OVERRIDE)
+elif _DEFAULT_ENV.is_file():
     load_dotenv(_DEFAULT_ENV)
 elif _LOCAL_ENV.is_file():
     load_dotenv(_LOCAL_ENV)
@@ -134,8 +137,9 @@ FEATURE_CHATGPT_PLANNER = _bool("FEATURE_CHATGPT_PLANNER", True)
 FEATURE_VEO = _bool("FEATURE_VEO", False)
 # Visuals step: Grok Imagine + Google Vids. Default ON; if not logged in or
 # out of free credits, the pipeline falls back to the existing FFmpeg title card.
-FEATURE_GROK_IMAGINE = _bool("FEATURE_GROK_IMAGINE", True)
-FEATURE_GOOGLE_VIDS = _bool("FEATURE_GOOGLE_VIDS", True)
+# On Termux/Android, browser clip sites are off unless the user explicitly enables them.
+FEATURE_GROK_IMAGINE = _bool("FEATURE_GROK_IMAGINE", not ANDROID)
+FEATURE_GOOGLE_VIDS = _bool("FEATURE_GOOGLE_VIDS", not ANDROID)
 FEATURE_YOUTUBE_UPLOAD = _bool("FEATURE_YOUTUBE_UPLOAD", False)
 FEATURE_AUTOPILOT = _bool("FEATURE_AUTOPILOT", False)
 FEATURE_CREDIT_CHECK = _bool("FEATURE_CREDIT_CHECK", False)
@@ -163,7 +167,9 @@ DAILY_SPEND_CAP_INR = float(os.getenv("DAILY_SPEND_CAP_INR", "40"))
 # Preferred planner: "chatgpt" (web, needs one-time login), then free Gemini
 # text API, then DeepSeek as last paid fallback. Set explicitly to "gemini"
 # or "deepseek" to skip earlier providers.
-PLANNER = os.getenv("PLANNER", "chatgpt").strip().lower() or "chatgpt"
+PLANNER = os.getenv("PLANNER", "gemini" if ANDROID else "chatgpt").strip().lower() or (
+    "gemini" if ANDROID else "chatgpt"
+)
 
 CHANNELS_PATH = os.getenv("CHANNELS_PATH", "").strip()
 STYLE_PROFILE_PATH = os.getenv("STYLE_PROFILE_PATH", "").strip()

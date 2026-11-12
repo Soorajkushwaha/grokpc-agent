@@ -12,9 +12,13 @@ import {
   Smile,
   Bot,
   ChevronRight,
+  Laptop,
+  Tablet,
+  Cloud,
 } from 'lucide-react';
 import { channelTheme, initials } from '../ui';
-import { STEP_LABELS } from '../types';
+import { BACKEND_OPTIONS, STEP_LABELS, type BackendId } from '../types';
+import { isConfigured } from '../api';
 
 const TOPIC_CHIPS: { label: string; Icon: React.ComponentType<{ className?: string }> }[] = [
   { label: 'Horror kahani', Icon: Ghost },
@@ -34,6 +38,9 @@ export const HomeScreen: React.FC = () => {
     status,
     jobs,
     saveSettings,
+    config,
+    updateConfig,
+    refreshHealth,
   } = useApp();
   const [topic, setTopic] = useState('');
   const [busy, setBusy] = useState(false);
@@ -44,6 +51,25 @@ export const HomeScreen: React.FC = () => {
   const running = jobs.find((j) => j.status === 'running' || j.status === 'queued');
   const autoFeature = Boolean(status?.features?.autopilot);
   const autoOn = Boolean(status?.autopilot?.enabled);
+
+  const WORKER_ICONS: Record<BackendId, React.ReactNode> = {
+    laptop: <Laptop className="w-3.5 h-3.5" />,
+    tablet: <Tablet className="w-3.5 h-3.5" />,
+    vps: <Cloud className="w-3.5 h-3.5" />,
+  };
+
+  const switchWorker = (id: BackendId) => {
+    const slot = config.backends?.[id] || { backendUrl: '', agentToken: '', vncUrl: '' };
+    updateConfig({
+      activeBackend: id,
+      backends: config.backends,
+      backendUrl: slot.backendUrl,
+      agentToken: slot.agentToken,
+      vncUrl: slot.vncUrl,
+      demoMode: !isConfigured(slot),
+    });
+    setTimeout(() => void refreshHealth(), 50);
+  };
 
   const submit = async () => {
     if (!topic.trim() || busy) return;
@@ -99,6 +125,41 @@ export const HomeScreen: React.FC = () => {
             );
           })}
         </div>
+      </section>
+
+      <section>
+        <h2 className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-400 mb-2.5">Kaunsa worker?</h2>
+        <div className="grid grid-cols-3 gap-1.5">
+          {BACKEND_OPTIONS.map((opt) => {
+            const filled = Boolean(config.backends?.[opt.id]?.backendUrl && config.backends?.[opt.id]?.agentToken);
+            const selected = (config.activeBackend || 'laptop') === opt.id;
+            return (
+              <button
+                key={opt.id}
+                type="button"
+                onClick={() => switchWorker(opt.id)}
+                className={`flex flex-col items-center gap-0.5 rounded-2xl border px-2 py-2 cursor-pointer min-h-[60px] transition-all duration-150 ${
+                  selected
+                    ? 'border-cyan-500/70 bg-cyan-950/70 text-white ring-1 ring-cyan-400/30'
+                    : 'border-white/8 bg-slate-950/70 text-slate-300 hover:border-white/16'
+                }`}
+              >
+                {WORKER_ICONS[opt.id]}
+                <span className="text-xs font-bold">{opt.label}</span>
+                {filled ? (
+                  <span className="text-[9px] text-emerald-400 font-medium">saved</span>
+                ) : (
+                  <span className="text-[9px] text-slate-500">settings</span>
+                )}
+              </button>
+            );
+          })}
+        </div>
+        {(config.activeBackend || 'laptop') === 'tablet' && (
+          <p className="mt-2 text-[11px] text-slate-400">
+            Tablet worker: kahani + awaz + FFmpeg basic visuals. Grok / Google Vids clips ke liye Laptop chuno.
+          </p>
+        )}
       </section>
 
       <section className="hero-card p-4 space-y-3.5">

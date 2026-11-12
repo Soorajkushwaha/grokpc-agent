@@ -25,6 +25,7 @@ from auth import cors_origins, require_auth, token_from_ws, tokens_match
 from channels import add_channel, delete_channel, get_channel, list_channels, update_channel
 from config import (
     ANDROID,
+    CHROME_PROFILE_DIR,
     DRY_RUN,
     FEATURE_AUTOPILOT,
     FEATURE_YOUTUBE_UPLOAD,
@@ -124,7 +125,7 @@ def _health_payload() -> dict[str, Any]:
         "ramUsedGb": mem_used_gb or 0,
         "diskTotalGb": round(total / (1024**3), 1),
         "diskUsedGb": round(used / (1024**3), 1),
-        "chromeProfileLocked": os.path.exists("/data/chrome_profile/SingletonLock"),
+        "chromeProfileLocked": os.path.exists(os.path.join(CHROME_PROFILE_DIR, "SingletonLock")),
         "gdriveMounted": os.path.isdir(gdrive) and os.path.ismount(gdrive),
         "novncPortActive": _port_open("127.0.0.1", 6080),
         "fastapiPortActive": True,

@@ -134,9 +134,15 @@ export const SettingsScreen: React.FC = () => {
           })}
         </div>
         {active === 'tablet' && (
-          <p className="text-[11px] text-amber-300 flex items-start gap-1.5 bg-amber-950/40 border border-amber-800/30 rounded-xl px-2.5 py-2">
+          <p className="text-[11px] text-cyan-200/90 flex items-start gap-1.5 bg-cyan-950/40 border border-cyan-800/30 rounded-xl px-2.5 py-2">
             <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" />
-            Tablet Phase 2 hai — abhi setup later. Pehle Laptop use karo.
+            <span>
+              Termux (F-Droid) me yeh command chalao, phir URL + token yahan paste karo:
+              <span className="block mt-1 font-mono text-[10px] text-cyan-100 break-all">
+                curl -fsSL https://raw.githubusercontent.com/Soorajkushwaha/grokpc-agent/main/scripts/tablet/install.sh | bash
+              </span>
+              Tablet pe story (Gemini/DeepSeek), gTTS aur FFmpeg basic visuals chalte hain. Grok Imagine / Google Vids laptop pe hi rahenge.
+            </span>
           </p>
         )}
         <label className="block space-y-1">

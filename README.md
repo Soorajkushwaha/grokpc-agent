@@ -22,7 +22,7 @@ Mobile control center + self-hosted backend that plans, voices, and edits YouTub
 | YouTube Studio upload + approve-publish | 2 | `FEATURE_YOUTUBE_UPLOAD=0` |
 | Autopilot (idle / quiet hours / daily caps) | 2 | `FEATURE_AUTOPILOT=0` |
 | Google AI Studio voice in the browser | 2 | `FEATURE_AISTUDIO_VOICE=0` |
-| Tablet (Termux) rollout | 2 | later — laptop first |
+| Tablet (Termux) 24x7 worker (story + gTTS + FFmpeg fallback visuals) | 1 | `scripts/tablet/install.sh` |
 
 ## Naya system kaise chalta hai (Hinglish)
 
@@ -57,7 +57,7 @@ Short version: the agent is already installed in WSL. After pulling this update,
 
 - Codespaces: **[CODESPACES.md](./CODESPACES.md)** (backup, not 24/7).
 - VPS: **[SERVER_STEPS.md](./SERVER_STEPS.md)** / **[PLATFORMS.md](./PLATFORMS.md)**.
-- Android tablet: **[android/README_HINDI.md](./android/README_HINDI.md)** — Phase 2. Planning/voice/FFmpeg can run; CapCut-on-Android is not supported.
+- Android tablet (24x7 worker, no browser clips): in F-Droid Termux run `curl -fsSL https://raw.githubusercontent.com/Soorajkushwaha/grokpc-agent/main/scripts/tablet/install.sh | bash`, then paste the URL + token into **Settings → Tablet**. Details: **[android/README_HINDI.md](./android/README_HINDI.md)** (older Chromium/noVNC path). CapCut-on-Android is not supported.
 
 ## Security
 
