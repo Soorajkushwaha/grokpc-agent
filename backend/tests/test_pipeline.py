@@ -46,7 +46,7 @@ import channels as channels_mod  # noqa: E402
 import db as dbmod  # noqa: E402
 import jobs as jobs_mod  # noqa: E402
 from main import app  # noqa: E402
-from planner import mock_plan, normalize_plan, plan_story  # noqa: E402
+from planner import mock_plan, normalize_plan, plan_story, plan_with_gemini  # noqa: E402
 from scheduler import channel_is_due, in_quiet_hours, should_run_autopilot, under_caps  # noqa: E402
 from runtime_settings import save_settings  # noqa: E402
 
@@ -192,6 +192,69 @@ def test_planner_unit() -> None:
     check("plan_story dry_run is mock", result["planner"] == "mock" and result["status"] == "ok", str(result))
 
 
+def test_plan_with_gemini_mocked() -> None:
+    """plan_with_gemini talks to generateContent; no live API, no real keys."""
+    import json
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    print("== plan_with_gemini mocked ==")
+    plan_obj = {
+        "title": "Purani haveli ka raaz",
+        "hook": "Ruko — haveli ke andar kuch hai.",
+        "story": "Ek short mystery.",
+        "scenes": [
+            {
+                "id": 1,
+                "narration": "Namaste.",
+                "visual": "Haveli",
+                "image_prompt": "old mansion",
+                "video_prompt": "slow pan",
+                "duration_sec": 5,
+            }
+        ],
+        "voiceover_script": "Namaste dosto.",
+        "thumbnail_prompt": "haveli thumbnail",
+        "tags": ["haveli"],
+        "description": "A mystery.",
+    }
+    payload = {
+        "candidates": [{"content": {"parts": [{"text": json.dumps(plan_obj)}]}}],
+        "usageMetadata": {"promptTokenCount": 11, "candidatesTokenCount": 22},
+    }
+    mock_resp = MagicMock()
+    mock_resp.raise_for_status = MagicMock()
+    mock_resp.json.return_value = payload
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock(return_value=mock_resp)
+    mock_client.__aenter__.return_value = mock_client
+    mock_client.__aexit__.return_value = False
+
+    async def _go():
+        with (
+            patch("planner.httpx.AsyncClient", return_value=mock_client),
+            patch("planner.GEMINI_API_KEY", "fake-test-key-not-real"),
+        ):
+            return await plan_with_gemini("Plan a short Hindi mystery video")
+
+    plan, meta = asyncio.run(_go())
+    check("gemini provider", meta.get("provider") == "gemini", str(meta))
+    check("gemini cost_inr is 0", meta.get("cost_inr") == 0, str(meta))
+    check("gemini tokens parsed", meta.get("tokens_in") == 11 and meta.get("tokens_out") == 22, str(meta))
+    check("gemini title from JSON", plan.get("title") == "Purani haveli ka raaz", str(plan.get("title")))
+    args, kwargs = mock_client.post.call_args
+    url = args[0] if args else kwargs.get("url", "")
+    check(
+        "generateContent v1beta URL",
+        "generativelanguage.googleapis.com/v1beta/models/" in url and url.endswith(":generateContent"),
+        url,
+    )
+    headers = kwargs.get("headers") or {}
+    check("x-goog-api-key header", headers.get("x-goog-api-key") == "fake-test-key-not-real", str(headers))
+    body = kwargs.get("json") or {}
+    mime = (body.get("generationConfig") or {}).get("responseMimeType")
+    check("responseMimeType application/json", mime == "application/json", str(body.get("generationConfig")))
+
+
 def test_scheduler_unit() -> None:
     print("== scheduler (Phase 2 logic, flag off) ==")
     import datetime as dt
@@ -259,6 +322,7 @@ def main() -> int:
         channel_id = test_status_and_channels(client)
         test_task_still_works(client)
         test_planner_unit()
+        test_plan_with_gemini_mocked()
         test_scheduler_unit()
         test_path_helpers()
         test_dry_run_pipeline(client, channel_id)

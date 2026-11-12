@@ -61,7 +61,11 @@ FRONTEND_ORIGINS = _csv(
 
 USE_GEMINI_TTS = _bool("USE_GEMINI_TTS", False)
 GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-3.8-flash-lite-tts")
-GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-2.5-flash")
+GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-3.8-flash")
+# Current free-tier text model (Nov 2026 docs): gemini-2.5-flash and gemini-3.5-flash
+# are deprecated. Official pricing lists gemini-3.8-flash as free of charge on the
+# Free tier (https://ai.google.dev/gemini-api/docs/pricing). Override via env.
+GEMINI_TEXT_MODEL = os.getenv("GEMINI_TEXT_MODEL", "gemini-3.8-flash")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-flash")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 
@@ -123,7 +127,7 @@ SCREENSHOT_TO_UI = _bool("SCREENSHOT_TO_UI", not ANDROID)
 # the current working path (browser vision + FFmpeg pipeline) without
 # touching live sites we have not tested.
 # ---------------------------------------------------------------------------
-# Phase 1 (on): ChatGPT/DeepSeek planning, voiceover, FFmpeg edit, CapCut helper, jobs API.
+# Phase 1 (on): ChatGPT/Gemini/DeepSeek planning, voiceover, FFmpeg edit, CapCut helper, jobs API.
 FEATURE_CAPCUT = _bool("FEATURE_CAPCUT", True)
 FEATURE_CHATGPT_PLANNER = _bool("FEATURE_CHATGPT_PLANNER", True)
 # Phase 2 (off until tested): paid/web video gen, YouTube, autopilot, credit scrape, AI Studio voice.
@@ -149,7 +153,9 @@ QUIET_HOURS = os.getenv("QUIET_HOURS", "23:00-07:00").strip()
 DAILY_VIDEO_CAP = int(os.getenv("DAILY_VIDEO_CAP", "3"))
 DAILY_SPEND_CAP_INR = float(os.getenv("DAILY_SPEND_CAP_INR", "40"))
 
-# Preferred planner: "chatgpt" (web, needs one-time login) then DeepSeek text fallback.
+# Preferred planner: "chatgpt" (web, needs one-time login), then free Gemini
+# text API, then DeepSeek as last paid fallback. Set explicitly to "gemini"
+# or "deepseek" to skip earlier providers.
 PLANNER = os.getenv("PLANNER", "chatgpt").strip().lower() or "chatgpt"
 
 CHANNELS_PATH = os.getenv("CHANNELS_PATH", "").strip()

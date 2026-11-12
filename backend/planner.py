@@ -1,8 +1,9 @@
 """Story + prompt planning.
 
 Phase 1: ChatGPT web (logged-in Chrome profile, one-time login via noVNC),
-then DeepSeek text API fallback. DRY_RUN returns a deterministic mock plan
-so the rest of the pipeline can be tested without network or a browser.
+then Google's free Gemini text API, then DeepSeek as last paid fallback.
+DRY_RUN returns a deterministic mock plan so the rest of the pipeline can
+be tested without network or a browser.
 """
 from __future__ import annotations
 
@@ -19,6 +20,8 @@ from config import (
     DEEPSEEK_MODEL,
     DRY_RUN,
     FEATURE_CHATGPT_PLANNER,
+    GEMINI_API_KEY,
+    GEMINI_TEXT_MODEL,
     PLANNER,
 )
 from db import record_usage
@@ -208,6 +211,85 @@ async def plan_with_deepseek(prompt: str) -> tuple[dict[str, Any], dict[str, Any
     return plan, meta
 
 
+GEMINI_GENERATE_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+)
+
+
+def _gemini_text(data: dict[str, Any]) -> str:
+    cands = data.get("candidates") or []
+    if not cands:
+        raise RuntimeError("Gemini returned no candidates")
+    parts = ((cands[0].get("content") or {}).get("parts") or [])
+    texts = [p.get("text", "") for p in parts if isinstance(p, dict) and p.get("text")]
+    if not texts:
+        raise RuntimeError("Gemini returned empty content")
+    return "\n".join(texts)
+
+
+async def plan_with_gemini(prompt: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Plan a video with the free-tier Gemini generateContent API."""
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is not set")
+    body = {
+        "systemInstruction": {
+            "parts": [
+                {
+                    "text": (
+                        "You are a YouTube video planner. Reply with one JSON object only, "
+                        "no markdown fences, no extra text."
+                    )
+                }
+            ]
+        },
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": prompt}],
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.6,
+            "responseMimeType": "application/json",
+        },
+    }
+    url = GEMINI_GENERATE_URL.format(model=GEMINI_TEXT_MODEL)
+    async with httpx.AsyncClient(timeout=90.0) as client:
+        resp = await client.post(
+            url,
+            headers={
+                "x-goog-api-key": GEMINI_API_KEY,
+                "Content-Type": "application/json",
+            },
+            json=body,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    content = _gemini_text(data)
+    usage = data.get("usageMetadata") or {}
+    tokens_in = int(usage.get("promptTokenCount") or 0)
+    tokens_out = int(usage.get("candidatesTokenCount") or 0)
+    rec = record_usage(
+        task_type="plan",
+        status="ok",
+        details="gemini-text",
+        tokens_in=tokens_in,
+        tokens_out=tokens_out,
+        provider="gemini",
+        model=GEMINI_TEXT_MODEL,
+        cost_usd=0.0,  # free-tier planning is logged as INR 0
+    )
+    plan = _extract_json(content)
+    meta = {
+        "provider": "gemini",
+        "model": GEMINI_TEXT_MODEL,
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
+        "cost_inr": rec.get("cost_inr", 0) or 0,
+    }
+    return plan, meta
+
+
 async def plan_with_chatgpt_web(
     prompt: str,
     *,
@@ -217,7 +299,7 @@ async def plan_with_chatgpt_web(
     """Best-effort: open chatgpt.com, paste the prompt, read JSON from the 'done' text.
 
     This is untested against the live ChatGPT DOM (sites change). Failures
-    should fall back to DeepSeek. Login walls return auth_required.
+    should fall back to Gemini, then DeepSeek. Login walls return auth_required.
     """
     if agent is None:
         raise RuntimeError("No browser agent available for ChatGPT planning")
@@ -282,7 +364,10 @@ async def plan_story(
         }
 
     errors: list[str] = []
-    prefer_chatgpt = FEATURE_CHATGPT_PLANNER and PLANNER != "deepseek"
+    # Explicit PLANNER=gemini or PLANNER=deepseek skips earlier providers.
+    # Default / PLANNER=chatgpt: ChatGPT web -> Gemini (free) -> DeepSeek.
+    prefer_chatgpt = FEATURE_CHATGPT_PLANNER and PLANNER not in {"deepseek", "gemini"}
+    prefer_gemini = bool(GEMINI_API_KEY) and PLANNER != "deepseek"
 
     if prefer_chatgpt and agent is not None:
         try:
@@ -293,11 +378,30 @@ async def plan_story(
             return {"status": "ok", "planner": "chatgpt", "plan": plan, "meta": meta}
         except ChatGPTAuthRequired as exc:
             errors.append(f"chatgpt_auth: {exc}")
-            await _emit("Planner", "ChatGPT login nahi mila — DeepSeek fallback")
+            await _emit("Planner", "ChatGPT login nahi mila — Gemini fallback")
         except Exception as exc:
             errors.append(f"chatgpt: {exc}")
             logger.warning("ChatGPT planning failed: %s", exc)
-            await _emit("Planner", f"ChatGPT fail ({exc}); DeepSeek try kar raha hoon")
+            await _emit("Planner", f"ChatGPT fail ({exc}); Gemini try kar raha hoon")
+
+    if prefer_gemini:
+        try:
+            await _emit("Planner", f"Gemini free API se plan ({GEMINI_TEXT_MODEL})")
+            raw, meta = await plan_with_gemini(prompt)
+            plan = normalize_plan(raw, topic)
+            await _emit("Planner", f"Gemini se plan mil gaya: {plan.get('title')}")
+            status = "fallback" if errors else "ok"
+            return {
+                "status": status,
+                "planner": "gemini",
+                "plan": plan,
+                "meta": meta,
+                "note": "; ".join(errors) if errors else "",
+            }
+        except Exception as exc:
+            errors.append(f"gemini: {exc}")
+            logger.warning("Gemini planning failed: %s", exc)
+            await _emit("Planner", f"Gemini fail ({exc}); DeepSeek try kar raha hoon")
 
     if DEEPSEEK_API_KEY:
         try:

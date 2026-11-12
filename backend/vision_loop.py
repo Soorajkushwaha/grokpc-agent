@@ -201,14 +201,15 @@ async def decide(prompt: str, screenshot_png: bytes, mock: Optional[MockLLM] = N
         return await mock.decide(prompt, screenshot_png)
     if DRY_RUN:
         return await MockLLM().decide(prompt, screenshot_png)
-    if DEEPSEEK_API_KEY:
-        try:
-            return await decide_deepseek(prompt, screenshot_png, mime=mime)
-        except Exception as exc:
-            logger.warning("DeepSeek vision failed, falling back to Gemini: %s", exc)
+    # Prefer free Gemini when a key is present; DeepSeek is the paid fallback.
     if GEMINI_API_KEY:
-        return await decide_gemini(prompt, screenshot_png, mime=mime)
-    raise RuntimeError("No vision LLM configured (set DEEPSEEK_API_KEY or GEMINI_API_KEY, or DRY_RUN=1)")
+        try:
+            return await decide_gemini(prompt, screenshot_png, mime=mime)
+        except Exception as exc:
+            logger.warning("Gemini vision failed, falling back to DeepSeek: %s", exc)
+    if DEEPSEEK_API_KEY:
+        return await decide_deepseek(prompt, screenshot_png, mime=mime)
+    raise RuntimeError("No vision LLM configured (set GEMINI_API_KEY or DEEPSEEK_API_KEY, or DRY_RUN=1)")
 
 
 _KEY_ALIASES = {
