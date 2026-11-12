@@ -160,7 +160,7 @@ apt-get install -y --no-install-recommends \\
   ca-certificates curl wget git jq unzip tar sudo rsync \\
   python3 python3-venv python3-pip python3-dev \\
   build-essential \\
-  xvfb icewm xterm \\
+  xvfb icewm xterm x11-xkb-utils \\
   x11vnc novnc websockify \\
   ffmpeg fonts-dejavu-core \\
   rclone fuse3 sqlite3 \\
@@ -282,9 +282,10 @@ ExecStartPre=/bin/sh -c 'rm -f /tmp/.X99-lock || true'
 ExecStart=/bin/bash -c '\\
   Xvfb :99 -screen 0 \${VIEW_W}x\${VIEW_H}x24 -nolisten tcp & \\
   sleep 2; \\
+  DISPLAY=:99 setxkbmap -layout us || true; \\
   DISPLAY=:99 icewm & \\
   sleep 1; \\
-  x11vnc -display :99 -localhost -forever -shared -rfbport 5900 -nopw -ncache 0 & \\
+  x11vnc -display :99 -localhost -forever -shared -rfbport 5900 -nopw -ncache 0 -xkb -skip_lockkeys -clear_mods -clear_keys & \\
   /usr/share/novnc/utils/novnc_proxy --vnc 127.0.0.1:5900 --listen 127.0.0.1:6080'
 Restart=always
 RestartSec=5

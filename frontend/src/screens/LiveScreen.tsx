@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useApp } from '../context/AppContext';
 import { novncIframeUrl, type NovncQuality } from '../api';
 import { Send, ChevronDown, Monitor, KeyRound, ScrollText, WifiOff, Maximize2 } from 'lucide-react';
@@ -58,7 +58,13 @@ export const LiveScreen: React.FC = () => {
   const [prompt, setPrompt] = useState('');
   const [loginsOpen, setLoginsOpen] = useState(false);
   const [prefs, setPrefs] = useState<ScreenPrefs>(DEFAULT_PREFS);
+  const iframeRef = useRef<HTMLIFrameElement>(null);
   const connected = !config.demoMode && health.connected;
+
+  const focusDesktop = () => {
+    iframeRef.current?.focus();
+  };
+
 
   useEffect(() => {
     setPrefs(loadScreenPrefs());
@@ -84,6 +90,12 @@ export const LiveScreen: React.FC = () => {
     () => novncIframeUrl(config, { viewOnly: prefs.viewOnly, quality: prefs.quality }),
     [config, prefs.viewOnly, prefs.quality],
   );
+
+  useEffect(() => {
+    if (prefs.viewOnly) return;
+    const t = window.setTimeout(() => iframeRef.current?.focus(), 250);
+    return () => window.clearTimeout(t);
+  }, [frameUrl, prefs.viewOnly]);
 
   const send = async () => {
     const t = prompt.trim();
@@ -178,16 +190,25 @@ export const LiveScreen: React.FC = () => {
               <Maximize2 className="w-3.5 h-3.5" />
               Full screen / naya tab
             </button>
+            <p className="w-full text-[10px] text-slate-500 leading-relaxed pt-0.5">
+              Type karne ke liye screen pe click karo. Backspace aur keys ab desktop tak jayenge.
+            </p>
           </div>
         )}
-        <div className="relative aspect-video bg-[#05080f]">
+        <div
+          className="relative aspect-video bg-[#05080f]"
+          onMouseDown={focusDesktop}
+        >
           {connected && frameUrl ? (
             <iframe
+              ref={iframeRef}
               key={frameUrl}
               title="Live desktop"
               src={frameUrl}
-              className="w-full h-full border-0 bg-black"
-              allow="clipboard-read; clipboard-write"
+              className="w-full h-full border-0 bg-black outline-none"
+              allow="clipboard-read; clipboard-write; keyboard-map"
+              tabIndex={0}
+              onLoad={focusDesktop}
             />
           ) : liveScreenshot ? (
             <img src={liveScreenshot} alt="screenshot" className="w-full h-full object-contain bg-black" />

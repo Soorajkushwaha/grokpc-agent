@@ -11,8 +11,9 @@ export DISPLAY=:99
 run() { local name="$1"; shift; if ! pgrep -f "$name" >/dev/null; then nohup "$@" >"$LOG/$(echo "$name"|tr -c 'a-z0-9' _).log" 2>&1 & fi; }
 run "Xvfb :99" Xvfb :99 -screen 0 "${W}x${H}x24" -nolisten tcp
 sleep 2
+DISPLAY=:99 setxkbmap -layout us || true
 run "icewm" icewm
-run "x11vnc -display :99" x11vnc -display :99 -localhost -forever -shared -rfbport 5900 -rfbauth "$APP_DIR/.vncpass" -ncache 0
+run "x11vnc -display :99" x11vnc -display :99 -localhost -forever -shared -rfbport 5900 -rfbauth "$APP_DIR/.vncpass" -ncache 0 -xkb -skip_lockkeys -clear_mods -clear_keys
 run "novnc_proxy" /usr/share/novnc/utils/novnc_proxy --vnc 127.0.0.1:5900 --listen 127.0.0.1:6080
 ( cd "$APP_DIR" && run "python main.py" "$APP_DIR/.venv/bin/python" main.py )
 if [[ "${GROKPC_NO_TUNNEL:-0}" != "1" ]] && command -v cloudflared >/dev/null; then
