@@ -1,3 +1,7 @@
+> **Laptop pe abhi shuru karna hai?** Card / VPS ka wait mat karo — [windows/README_HINDI.md](./windows/README_HINDI.md). Testing ke liye [CODESPACES.md](./CODESPACES.md). Saste UPI options: [PLATFORMS.md](./PLATFORMS.md).
+>
+> Quick tunnel ab installer khud `grokpc-tunnel` service se chalaata hai; URL ke liye `sudo bash /app/agent/show_urls.sh`. Named (stable) tunnel ke steps [windows/README_HINDI.md](./windows/README_HINDI.md#optional-named-cloudflare-tunnel-url-same-rehti-hai) me hain.
+
 # GrokPC backend — kisi bhi Ubuntu 24.04 VPS pe
 
 App already live hai:

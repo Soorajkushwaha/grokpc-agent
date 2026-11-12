@@ -61,6 +61,18 @@ case "$ARCH" in
   *) echo "Unsupported architecture: $ARCH (need x86_64 or aarch64)" >&2; exit 1 ;;
 esac
 
+# --- environment detection ---
+IS_WSL=0
+if grep -qiE '(microsoft|wsl)' /proc/sys/kernel/osrelease 2>/dev/null || [[ -n "\${WSL_DISTRO_NAME:-}" ]]; then
+  IS_WSL=1
+fi
+HAS_SYSTEMD=0
+if [[ -d /run/systemd/system ]] && [[ "$(ps -p 1 -o comm= 2>/dev/null)" == "systemd" ]]; then
+  HAS_SYSTEMD=1
+fi
+IS_CODESPACE=0
+if [[ -n "\${CODESPACES:-}" ]]; then IS_CODESPACE=1; fi
+
 MEM_KB="$(awk '/MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
 MEM_GB=$(( MEM_KB / 1024 / 1024 ))
 LOW_MEMORY=0
@@ -81,6 +93,7 @@ echo "=== GrokPC server setup ==="
 echo "User: $INSTALL_USER"
 echo "Arch: $ARCH ($ARCH_FAMILY)"
 echo "RAM:  \${MEM_GB} GB  (low-memory mode: $LOW_MEMORY)"
+echo "WSL: $IS_WSL  systemd: $HAS_SYSTEMD  codespace: $IS_CODESPACE"
 echo "Source: $APP_SRC"
 echo "Target: $APP_DIR"
 
@@ -132,7 +145,13 @@ ensure_swap() {
   fi
   echo "Swap is now: $(awk '/SwapTotal:/ {print $2}' /proc/meminfo) kB"
 }
-ensure_swap
+if [[ "$IS_WSL" -eq 1 ]]; then
+  echo "WSL detected: swap is managed by Windows (.wslconfig) — skipping swapfile."
+elif [[ "$IS_CODESPACE" -eq 1 || "$HAS_SYSTEMD" -eq 0 ]]; then
+  echo "Container without systemd — skipping swapfile."
+else
+  ensure_swap
+fi
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
@@ -171,6 +190,7 @@ fi
 mkdir -p "$APP_DIR" "$DATA_DIR" "$CHROME_DIR" "$OUTPUT_DIR" "$GDRIVE_DIR" /app/logs
 rsync -a --delete --exclude '.env' --exclude '.venv' --exclude '.vncpass' --exclude '__pycache__' --exclude '.git' \\
   "$APP_SRC/" "$APP_DIR/"
+chmod +x "$APP_DIR"/setup_server.sh "$APP_DIR"/run_tunnel.sh "$APP_DIR"/show_urls.sh "$APP_DIR"/start_stack.sh 2>/dev/null || true
 
 if [[ ! -x "$APP_DIR/.venv/bin/python" ]]; then
   python3 -m venv "$APP_DIR/.venv"
@@ -333,12 +353,55 @@ if ! command -v cloudflared >/dev/null 2>&1; then
   rm -f "$CF_DEB"
 fi
 
-systemctl daemon-reload
-# Migrate old Oracle unit names if this box was installed earlier
-systemctl disable --now oracle-desktop.service 2>/dev/null || true
-systemctl disable --now oracle-agent.service 2>/dev/null || true
-systemctl enable --now grokpc-desktop.service
-systemctl enable --now grokpc-agent.service
+# Quick tunnel service: exposes 127.0.0.1:8000 (API + /novnc) and 127.0.0.1:6080,
+# writes current URLs to /app/data/tunnel_url.txt and tunnel_vnc_url.txt
+cat > /etc/systemd/system/grokpc-tunnel.service <<EOF
+[Unit]
+Description=GrokPC Cloudflare quick tunnel (API)
+After=network-online.target grokpc-agent.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=\${INSTALL_USER}
+ExecStart=/bin/bash \${APP_DIR}/run_tunnel.sh 8000 \${DATA_DIR}/tunnel_url.txt
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat > /etc/systemd/system/grokpc-tunnel-vnc.service <<EOF
+[Unit]
+Description=GrokPC Cloudflare quick tunnel (noVNC)
+After=network-online.target grokpc-desktop.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=\${INSTALL_USER}
+ExecStart=/bin/bash \${APP_DIR}/run_tunnel.sh 6080 \${DATA_DIR}/tunnel_vnc_url.txt
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+if [[ "$HAS_SYSTEMD" -eq 1 ]]; then
+  systemctl daemon-reload
+  systemctl disable --now oracle-desktop.service 2>/dev/null || true
+  systemctl disable --now oracle-agent.service 2>/dev/null || true
+  systemctl enable --now grokpc-desktop.service
+  systemctl enable --now grokpc-agent.service
+  if [[ "\${GROKPC_NO_TUNNEL:-0}" != "1" ]]; then
+    systemctl enable --now grokpc-tunnel.service grokpc-tunnel-vnc.service
+  fi
+else
+  echo "No systemd: starting the stack with start_stack.sh (background processes)."
+  sudo -u "$INSTALL_USER" -H bash "$APP_DIR/start_stack.sh" || true
+fi
 
 echo
 echo "================================================================"
@@ -360,6 +423,15 @@ if [[ -n "\${GEN_VNCPW}" ]]; then
   echo "  (stored in \${VNC_PASS_FILE})"
   echo
 fi
+sleep 8
+if [[ -s "\${DATA_DIR}/tunnel_url.txt" ]]; then
+  echo "Backend tunnel URL:  $(cat "\${DATA_DIR}/tunnel_url.txt")"
+fi
+if [[ -s "\${DATA_DIR}/tunnel_vnc_url.txt" ]]; then
+  echo "noVNC tunnel URL:    $(cat "\${DATA_DIR}/tunnel_vnc_url.txt")/vnc.html"
+fi
+echo "Show again any time: sudo bash \${APP_DIR}/show_urls.sh"
+echo
 echo "Next:"
 echo "  1. Edit \${ENV_FILE} and add DEEPSEEK_API_KEY (optional GEMINI / Telegram)."
 echo "     Then: sudo systemctl restart grokpc-agent"

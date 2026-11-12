@@ -1,0 +1,32 @@
+{
+  "name": "GrokPC agent",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04",
+  "remoteUser": "vscode",
+  "hostRequirements": {
+    "cpus": 4,
+    "memory": "16gb",
+    "storage": "32gb"
+  },
+  "postCreateCommand": "sudo -E bash .devcontainer/post-create.sh",
+  "postStartCommand": "sudo -E bash .devcontainer/post-start.sh",
+  "forwardPorts": [8000, 6080],
+  "portsAttributes": {
+    "8000": {
+      "label": "GrokPC API",
+      "onAutoForward": "notify",
+      "visibility": "private"
+    },
+    "6080": {
+      "label": "noVNC",
+      "onAutoForward": "notify",
+      "visibility": "private"
+    }
+  },
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "bash"
+      }
+    }
+  }
+}
