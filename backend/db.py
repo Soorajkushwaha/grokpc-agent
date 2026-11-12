@@ -1,6 +1,10 @@
 """SQLite task + cost tracking."""
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger("grokpc.db")
+
 import os
 import sqlite3
 import time
@@ -92,19 +96,7 @@ def record_usage(
         cost_usd = estimate_cost_usd(provider, tokens_in, tokens_out, kind)
     cost_inr = round(cost_usd * USD_INR_RATE, 4)
     row_id = f"{int(time.time()*1000)}-{uuid.uuid4().hex[:8]}"
-    conn = connect()
-    conn.execute(
-        """
-        INSERT INTO task_logs (
-            id, task_type, status, details, tokens_in, tokens_out,
-            provider, model, cost_usd, cost_inr
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (row_id, task_type, status, details, tokens_in, tokens_out, provider, model, cost_usd, cost_inr),
-    )
-    conn.commit()
-    conn.close()
-    return {
+    rec = {
         "id": row_id,
         "tokens_in": tokens_in,
         "tokens_out": tokens_out,
@@ -113,6 +105,23 @@ def record_usage(
         "cost_usd": round(cost_usd, 6),
         "cost_inr": cost_inr,
     }
+    try:
+        conn = connect()
+        conn.execute(
+            """
+            INSERT INTO task_logs (
+                id, task_type, status, details, tokens_in, tokens_out,
+                provider, model, cost_usd, cost_inr
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (row_id, task_type, status, details, tokens_in, tokens_out, provider, model, cost_usd, cost_inr),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        # A missing/uninitialized DB must not fail a finished video render.
+        logger.exception("record_usage failed")
+    return rec
 
 
 def budget_summary() -> dict[str, Any]:

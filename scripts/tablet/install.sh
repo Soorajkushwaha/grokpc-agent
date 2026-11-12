@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# GrokPC Termux installer: 24x7 tablet worker (story → gTTS → FFmpeg fallback visuals).
+# GrokPC Termux installer: 24x7 tablet worker (story → Gemini/edge-tts/gTTS → Pollinations + FFmpeg).
 # Safe to run as: curl -fsSL https://raw.githubusercontent.com/Soorajkushwaha/grokpc-agent/main/scripts/tablet/install.sh | bash
 # Interactive prompts always read from /dev/tty so they work when the script is piped.
 set -euo pipefail
@@ -182,7 +182,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
 done < "$REQ"
 
 # requirements-termux.txt already omits playwright; if we used it, also make sure core pkgs are present
-pip install fastapi uvicorn httpx pydantic google-genai gTTS python-dotenv websockets >/dev/null 2>&1 || true
+pip install fastapi uvicorn httpx pydantic google-genai gTTS edge-tts python-dotenv websockets >/dev/null 2>&1 || true
 
 say "[4/6] .env (token + keys)..."
 umask 077
@@ -210,7 +210,12 @@ PLANNER=gemini
 GEMINI_TEXT_MODEL=gemini-3.5-flash-lite
 FEATURE_GROK_IMAGINE=0
 FEATURE_GOOGLE_VIDS=0
+FEATURE_POLLINATIONS=1
 FEATURE_VEO=0
+USE_GEMINI_TTS=1
+GEMINI_TTS_MODEL=gemini-3.8-flash-tts
+GEMINI_TTS_VOICE=Charon
+TTS_VOICE=hi-IN-MadhurNeural
 FEATURE_YOUTUBE_UPLOAD=0
 FEATURE_AUTOPILOT=0
 FEATURE_CAPCUT=0
@@ -226,6 +231,8 @@ else
   [[ -z "$(env_get GEMINI_TEXT_MODEL)" ]] && env_set GEMINI_TEXT_MODEL gemini-3.5-flash-lite
   [[ -z "$(env_get FEATURE_GROK_IMAGINE)" ]] && env_set FEATURE_GROK_IMAGINE 0
   [[ -z "$(env_get FEATURE_GOOGLE_VIDS)" ]] && env_set FEATURE_GOOGLE_VIDS 0
+  [[ -z "$(env_get FEATURE_POLLINATIONS)" ]] && env_set FEATURE_POLLINATIONS 1
+  [[ -z "$(env_get USE_GEMINI_TTS)" ]] && env_set USE_GEMINI_TTS 1
   [[ -z "$(env_get OUTPUT_DIR)" ]] && env_set OUTPUT_DIR "${DATA}/outputs"
   [[ -z "$(env_get DB_PATH)" ]] && env_set DB_PATH "${DATA}/agent_tasks.db"
   [[ -z "$(env_get CHROME_PROFILE_DIR)" ]] && env_set CHROME_PROFILE_DIR "${DATA}/chrome_profile"
@@ -319,7 +326,8 @@ say "  4. Termux:Boot app ek baar kholo (pehli baar zaroori)."
 say "  5. Quick tunnel reboot ke baad badal sakti hai — naya URL show.sh se lo."
 say "================================================================"
 say "Is worker pe Grok Imagine / Google Vids nahi chalte. Story Gemini/DeepSeek,"
-say "awaz gTTS, visuals FFmpeg title-card fallback se banti hain."
+say "awaz Gemini TTS (ya edge-tts / gTTS fallback), visuals Pollinations stills"
+say "+ FFmpeg Ken Burns se banti hain. Font mile to Hindi subtitles bhi jalenge."
 if [[ "$created_env" == "1" ]]; then
   :
 fi

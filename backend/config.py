@@ -62,8 +62,16 @@ FRONTEND_ORIGINS = _csv(
     ],
 )
 
-USE_GEMINI_TTS = _bool("USE_GEMINI_TTS", False)
-GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-3.8-flash-lite-tts")
+USE_GEMINI_TTS = _bool("USE_GEMINI_TTS", True)
+# Free-tier Gemini TTS. 3.8-flash-tts first; 2.5-flash-preview-tts is the fallback.
+GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-3.8-flash-tts")
+GEMINI_TTS_VOICE = os.getenv("GEMINI_TTS_VOICE", "Charon").strip() or "Charon"
+# edge-tts fallback (pure Python). Madhur = male Hindi; Swara = female via TTS_VOICE.
+TTS_VOICE = os.getenv("TTS_VOICE", "hi-IN-MadhurNeural").strip() or "hi-IN-MadhurNeural"
+TTS_RATE = os.getenv("TTS_RATE", "-8%").strip() or "-8%"
+TTS_PITCH = os.getenv("TTS_PITCH", "-8Hz").strip() or "-8Hz"
+# Minimum seconds per scene narration (0 = follow spoken length only).
+TARGET_SCENE_SEC = float(os.getenv("TARGET_SCENE_SEC", "0") or 0)
 GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-3.8-flash")
 # Current free-tier text model (Nov 2026 docs): gemini-2.5-flash and gemini-3.5-flash
 # are deprecated. Official pricing lists gemini-3.8-flash as free of charge on the
@@ -126,28 +134,32 @@ SCREENSHOT_QUALITY = int(os.getenv("SCREENSHOT_QUALITY", "45"))
 SCREENSHOT_TO_UI = _bool("SCREENSHOT_TO_UI", not ANDROID)
 
 # ---------------------------------------------------------------------------
-# Phase flags. YouTube / Veo / autopilot stay off until tested. Grok Imagine
-# and Google Vids (visuals step) default ON and fall back to FFmpeg if the
-# browser is not logged in, credits are missing, or generation times out.
+# Phase flags. YouTube / Veo / autopilot stay off until tested.
+# Default visuals are free Pollinations stills + Ken Burns (no browser, no login).
+# Grok Imagine and Google Vids are OFF unless explicitly enabled — they previously
+# captured marketing-page UI instead of generated clips.
 # ---------------------------------------------------------------------------
-# Phase 1 (on): ChatGPT/Gemini/DeepSeek planning, voiceover, visuals, FFmpeg edit, CapCut helper, jobs API.
+# Phase 1 (on): planning, voiceover, Pollinations visuals, FFmpeg edit, CapCut helper, jobs API.
 FEATURE_CAPCUT = _bool("FEATURE_CAPCUT", True)
 FEATURE_CHATGPT_PLANNER = _bool("FEATURE_CHATGPT_PLANNER", True)
 # Still-off until tested: Veo API, YouTube, autopilot, billing-page scrape, AI Studio voice.
 FEATURE_VEO = _bool("FEATURE_VEO", False)
-# Visuals step: Grok Imagine + Google Vids. Default ON; if not logged in or
-# out of free credits, the pipeline falls back to the existing FFmpeg title card.
-# On Termux/Android, browser clip sites are off unless the user explicitly enables them.
-FEATURE_GROK_IMAGINE = _bool("FEATURE_GROK_IMAGINE", not ANDROID)
-FEATURE_GOOGLE_VIDS = _bool("FEATURE_GOOGLE_VIDS", not ANDROID)
+# Browser clip sites: default OFF on every platform. Only use if logged in AND
+# the provider actually downloads a generated video file (UI captures are rejected).
+FEATURE_GROK_IMAGINE = _bool("FEATURE_GROK_IMAGINE", False)
+FEATURE_GOOGLE_VIDS = _bool("FEATURE_GOOGLE_VIDS", False)
+# Default free visual source: Pollinations Flux stills, then Ken Burns in FFmpeg.
+FEATURE_POLLINATIONS = _bool("FEATURE_POLLINATIONS", True)
 FEATURE_YOUTUBE_UPLOAD = _bool("FEATURE_YOUTUBE_UPLOAD", False)
 FEATURE_AUTOPILOT = _bool("FEATURE_AUTOPILOT", False)
 FEATURE_CREDIT_CHECK = _bool("FEATURE_CREDIT_CHECK", False)
 FEATURE_AISTUDIO_VOICE = _bool("FEATURE_AISTUDIO_VOICE", False)
 
-# Caps for the visuals step (never buy credits; fall back when these are hit).
+# Caps for the (optional) browser-clip visuals step. Image scenes use MAX_IMAGE_SCENES.
 MAX_CLIPS_PER_JOB = int(os.getenv("MAX_CLIPS_PER_JOB", "4"))
 CLIP_TIMEOUT_SEC = int(os.getenv("CLIP_TIMEOUT_SEC", "240"))
+MAX_IMAGE_SCENES = int(os.getenv("MAX_IMAGE_SCENES", "10"))
+POLLINATIONS_MODEL = os.getenv("POLLINATIONS_MODEL", "flux").strip() or "flux"
 
 # Windows desktop helper (Phase 1, optional). WSL2 localhost forwarding reaches
 # a Windows process bound to 127.0.0.1 (already enabled in windows/install.ps1).
@@ -204,6 +216,7 @@ def feature_flags() -> dict[str, bool]:
         "veo": FEATURE_VEO,
         "grok_imagine": FEATURE_GROK_IMAGINE,
         "google_vids": FEATURE_GOOGLE_VIDS,
+        "pollinations": FEATURE_POLLINATIONS,
         "youtube_upload": FEATURE_YOUTUBE_UPLOAD,
         "autopilot": FEATURE_AUTOPILOT,
         "credit_check": FEATURE_CREDIT_CHECK,
@@ -214,7 +227,7 @@ def feature_flags() -> dict[str, bool]:
 def pipeline_steps() -> list[str]:
     """Ordered job steps for the currently enabled feature set."""
     steps = ["story", "voiceover"]
-    if FEATURE_VEO or FEATURE_GROK_IMAGINE or FEATURE_GOOGLE_VIDS:
+    if FEATURE_VEO or FEATURE_GROK_IMAGINE or FEATURE_GOOGLE_VIDS or FEATURE_POLLINATIONS:
         steps.append("visuals")
     steps.append("edit")
     if FEATURE_YOUTUBE_UPLOAD:

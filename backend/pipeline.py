@@ -1,6 +1,6 @@
 """Phase 1 video pipeline orchestrator.
 
-Order: story+prompts -> voiceover -> visuals (Grok Imagine / Google Vids) -> FFmpeg edit
+Order: story+prompts -> voiceover -> visuals (Pollinations stills; optional Grok) -> FFmpeg edit
 (CapCut prepared if helper is up). Visuals fall back to the existing title-card path
 when not logged in, out of credits, or generation fails. Optional Phase 2 steps
 (upload) are inserted only when their flags are on.
@@ -21,8 +21,10 @@ from config import (
     FEATURE_AUTOPILOT,
     FEATURE_GOOGLE_VIDS,
     FEATURE_GROK_IMAGINE,
+    FEATURE_POLLINATIONS,
     FEATURE_VEO,
     FEATURE_YOUTUBE_UPLOAD,
+    TARGET_SCENE_SEC,
     output_dir,
     pipeline_steps,
 )
@@ -40,6 +42,7 @@ from jobs import (
 )
 from planner import plan_story
 from video_pipeline import synthesize_voice_safe
+from voiceover import load_cues
 
 logger = logging.getLogger("grokpc.pipeline")
 LogFn = Callable[[dict[str, Any]], Awaitable[None]]
@@ -186,7 +189,28 @@ class PipelineRunner:
                 script = (plan or {}).get("voiceover_script") or job["topic"]
                 lang = channel.get("language") or "Hindi"
                 dest = output_dir() / f"voice_{job_id}.mp3"
-                engine = await synthesize_voice_safe(script, lang, dest, log=self.broadcast)
+                segments = []
+                for sc in (plan or {}).get("scenes") or []:
+                    if not isinstance(sc, dict):
+                        continue
+                    narr = str(sc.get("narration") or "").strip()
+                    if not narr:
+                        continue
+                    try:
+                        min_sec = float(sc.get("duration_sec") or 0)
+                    except (TypeError, ValueError):
+                        min_sec = 0.0
+                    if TARGET_SCENE_SEC and min_sec < TARGET_SCENE_SEC:
+                        min_sec = float(TARGET_SCENE_SEC)
+                    segments.append({"text": narr, "min_sec": min_sec})
+                engine = await synthesize_voice_safe(
+                    script, lang, dest, log=self.broadcast, segments=segments or None
+                )
+                # synthesize may write .wav if mp3 encode failed
+                if not dest.is_file():
+                    alt = dest.with_suffix(".wav")
+                    if alt.is_file():
+                        dest = alt
                 voice_path = dest
                 update_job(job_id, voice_path=str(dest))
                 set_step(job_id, "voiceover", "success", f"engine={engine}")
@@ -194,7 +218,7 @@ class PipelineRunner:
 
             elif name in {"visuals", "generate"}:
                 # "visuals" is the current step name; "generate" is kept for older jobs.
-                if not (FEATURE_VEO or FEATURE_GROK_IMAGINE or FEATURE_GOOGLE_VIDS):
+                if not (FEATURE_VEO or FEATURE_GROK_IMAGINE or FEATURE_GOOGLE_VIDS or FEATURE_POLLINATIONS):
                     set_step(job_id, name, "skipped", "visuals flags off")
                     continue
                 from generators import generate_media
@@ -240,11 +264,13 @@ class PipelineRunner:
                 title = (plan or {}).get("title") or job["topic"]
                 duration = 20
                 if plan and plan.get("scenes"):
-                    duration = max(8, sum(int(s.get("duration_sec") or 5) for s in plan["scenes"]))
+                    duration = max(8, sum(int(s.get("duration_sec") or 8) for s in plan["scenes"]))
                 aspect = channel.get("aspect") or "16:9"
-                images = [p for p in media_paths if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}]
+                images = [p for p in media_paths if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".ppm"}]
                 clips = [p for p in media_paths if p.suffix.lower() in {".mp4", ".webm", ".mov", ".mkv"}]
                 dest = output_dir() / f"final_{job_id}.mp4"
+                script = (plan or {}).get("voiceover_script") or job["topic"]
+                cues = load_cues(voice_path) if voice_path else []
                 edited = await edit_video(
                     title=title,
                     audio_path=voice_path,
@@ -254,6 +280,8 @@ class PipelineRunner:
                     aspect=aspect,
                     log=self.broadcast,
                     dest=dest,
+                    cues=cues,
+                    script=script,
                 )
                 final_path = Path(edited["video_path"])
                 update_job(job_id, video_path=str(final_path), final_path=str(final_path))

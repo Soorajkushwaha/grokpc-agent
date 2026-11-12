@@ -1,4 +1,4 @@
-"""FFmpeg + gTTS video pipeline. Optional Gemini TTS behind USE_GEMINI_TTS."""
+"""FFmpeg video pipeline: Gemini/edge-tts/gTTS voice, Ken Burns stills, BGM, subtitles."""
 from __future__ import annotations
 
 import asyncio
@@ -7,13 +7,17 @@ import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
-from config import (
-    GEMINI_API_KEY,
-    GEMINI_TTS_MODEL,
-    USE_GEMINI_TTS,
-    output_dir,
-)
+from config import output_dir
 from db import record_usage
+from voiceover import (  # noqa: F401 — re-exports for existing callers/tests
+    load_cues,
+    media_duration as _voice_duration,
+    save_cues,
+    synthesize_voice,
+    synthesize_voice_full,
+    synthesize_voice_safe,
+    write_silent_audio,
+)
 
 logger = logging.getLogger("grokpc.video")
 
@@ -25,69 +29,6 @@ async def _emit(log: Optional[LogFn], typ: str, title: str, message: str) -> Non
         await log({"type": typ, "title": title, "message": message})
 
 
-def _write_gtts(script: str, lang: str, dest: Path) -> None:
-    from gtts import gTTS
-
-    code = "hi" if (lang or "").lower().startswith("hi") else "en"
-    tts = gTTS(text=script, lang=code, slow=False)
-    tts.save(str(dest))
-
-
-async def _gemini_tts(script: str, dest: Path) -> dict[str, Any]:
-    """Generate speech with Gemini TTS. Verified model id: gemini-3.8-flash-lite-tts."""
-    from google import genai
-    from google.genai import types
-
-    client = genai.Client(api_key=GEMINI_API_KEY)
-    response = await client.aio.models.generate_content(
-        model=GEMINI_TTS_MODEL,
-        contents=script,
-        config=types.GenerateContentConfig(
-            response_modalities=["AUDIO"],
-            speech_config=types.SpeechConfig(
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Kore")
-                )
-            ),
-        ),
-    )
-    # google-genai returns inline audio data on the first part when successful
-    data = None
-    try:
-        data = response.candidates[0].content.parts[0].inline_data.data
-    except Exception as exc:
-        raise RuntimeError(f"Gemini TTS returned no audio: {exc}") from exc
-    dest.write_bytes(data)
-    usage = getattr(response, "usage_metadata", None)
-    tokens_in = int(getattr(usage, "prompt_token_count", 0) or 0) if usage else 0
-    tokens_out = int(getattr(usage, "candidates_token_count", 0) or 0) if usage else 0
-    rec = record_usage(
-        task_type="tts",
-        status="ok",
-        details=GEMINI_TTS_MODEL,
-        tokens_in=tokens_in,
-        tokens_out=tokens_out,
-        provider="gemini",
-        model=GEMINI_TTS_MODEL,
-        kind="tts",
-    )
-    return rec
-
-
-async def synthesize_voice(script: str, lang: str, dest: Path, log: Optional[LogFn] = None) -> str:
-    if USE_GEMINI_TTS and GEMINI_API_KEY:
-        try:
-            await _emit(log, "action", "Gemini TTS", f"Synthesizing with {GEMINI_TTS_MODEL}")
-            await _gemini_tts(script, dest)
-            return "gemini"
-        except Exception as exc:
-            logger.warning("Gemini TTS failed, falling back to gTTS: %s", exc)
-            await _emit(log, "system", "TTS fallback", f"Gemini TTS failed ({exc}); using free gTTS")
-    await _emit(log, "action", "gTTS", f"Synthesizing free {lang} voiceover")
-    await asyncio.to_thread(_write_gtts, script, lang, dest)
-    return "gtts"
-
-
 async def render_video(
     *,
     topic: str,
@@ -96,109 +37,29 @@ async def render_video(
     duration_seconds: int = 15,
     log: Optional[LogFn] = None,
 ) -> dict[str, Any]:
+    """Legacy entry used by /api/video: voiceover + FFmpeg assemble (title card if no stills)."""
     out = output_dir()
     stamp = int(time.time())
     safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in topic)[:40] or "video"
     audio = out / f"voice_{stamp}.mp3"
     final = out / f"{safe}_{stamp}.mp4"
-
-    engine = await synthesize_voice(script, language, audio, log=log)
-    await _emit(log, "terminal", "FFmpeg", f"Rendering {final.name}")
-
-    # Title card + voiceover. If audio is raw PCM from Gemini (often audio/L16), try ffmpeg anyway;
-    # gTTS writes mp3 which ffmpeg handles natively. If Gemini writes raw bytes, we may need -f.
-    cmd = [
-        "ffmpeg", "-y",
-        "-f", "lavfi", "-i", f"color=c=0x0a101f:s=1280x720:d={max(duration_seconds, 8)}",
-        "-i", str(audio),
-        "-filter_complex",
-        f"drawtext=text='{topic.replace(chr(39), '')[:80]}':fontcolor=white:fontsize=36:x=(w-text_w)/2:y=(h-text_h)/2",
-        "-c:v", "libx264", "-tune", "stillimage", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "128k",
-        "-shortest",
-        str(final),
-    ]
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    engine = await synthesize_voice_safe(script, language, audio, log=log)
+    if not audio.is_file():
+        alt = audio.with_suffix(".wav")
+        if alt.is_file():
+            audio = alt
+    result = await assemble_video(
+        title=topic,
+        audio_path=audio,
+        duration_seconds=max(int(duration_seconds), 8),
+        log=log,
+        dest=final,
+        script=script,
+        cues=load_cues(audio),
     )
-    _out, err = await proc.communicate()
-    if proc.returncode != 0:
-        # Retry without drawtext (fonts may be missing on a fresh VM)
-        cmd = [
-            "ffmpeg", "-y",
-            "-f", "lavfi", "-i", f"color=c=0x0a101f:s=1280x720:d={max(duration_seconds, 8)}",
-            "-i", str(audio),
-            "-c:v", "libx264", "-tune", "stillimage", "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "128k",
-            "-shortest",
-            str(final),
-        ]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        _out, err = await proc.communicate()
-        if proc.returncode != 0:
-            raise RuntimeError(err.decode("utf-8", "replace")[-1500:])
-
-    await _emit(log, "system", "Video ready", f"Saved to {final}")
-    record_usage(task_type="video", status="ok", details=str(final), provider=engine, model=engine)
-    return {
-        "status": "success",
-        "video_path": str(final),
-        "audio_path": str(audio),
-        "voice_engine": engine,
-    }
-
-
-
-async def write_silent_audio(dest: Path, seconds: float = 4.0) -> None:
-    """Generate a short silent MP3 with ffmpeg so DRY_RUN / offline boxes still work."""
-    import shutil
-
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    if not shutil.which("ffmpeg"):
-        # Minimal valid-ish MP3 header + silence is hard; write a wav instead.
-        import wave, struct
-        dest_wav = dest.with_suffix(".wav")
-        with wave.open(str(dest_wav), "w") as w:
-            w.setnchannels(1)
-            w.setsampwidth(2)
-            w.setframerate(16000)
-            w.writeframes(b"\x00\x00" * int(16000 * seconds))
-        if dest.suffix.lower() != ".wav":
-            dest.write_bytes(dest_wav.read_bytes())
-        return
-    cmd = [
-        "ffmpeg", "-y",
-        "-f", "lavfi", "-i", f"anullsrc=r=16000:cl=mono",
-        "-t", str(max(1.0, seconds)),
-        "-c:a", "libmp3lame", "-q:a", "9",
-        str(dest),
-    ]
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-    )
-    _out, err = await proc.communicate()
-    if proc.returncode != 0 or not dest.is_file():
-        raise RuntimeError(err.decode("utf-8", "replace")[-800:] or "ffmpeg silent audio failed")
-
-
-async def synthesize_voice_safe(script: str, lang: str, dest: Path, log: Optional[LogFn] = None) -> str:
-    """Phase 1 voiceover: Gemini TTS (opt-in) -> gTTS -> silent ffmpeg (DRY_RUN / offline)."""
-    from config import DRY_RUN
-
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    if DRY_RUN:
-        await _emit(log, "action", "Voiceover", "DRY_RUN silent audio (no gTTS network call)")
-        await write_silent_audio(dest, seconds=max(3.0, min(12.0, len(script or "") / 12)))
-        return "dry_run"
-    try:
-        return await synthesize_voice(script, lang, dest, log=log)
-    except Exception as exc:
-        logger.warning("Voiceover failed (%s); writing silent audio", exc)
-        await _emit(log, "system", "TTS fallback", f"{exc}; silent audio so edit can continue")
-        await write_silent_audio(dest, seconds=6.0)
-        return "silent"
+    result["audio_path"] = str(audio)
+    result["voice_engine"] = engine
+    return result
 
 
 def _escape_drawtext(text: str) -> str:
@@ -370,15 +231,20 @@ async def assemble_video(
     aspect: str = "16:9",
     log: Optional[LogFn] = None,
     dest: Optional[Path] = None,
+    cues: Optional[list[dict[str, Any]]] = None,
+    script: str = "",
 ) -> dict[str, Any]:
-    """FFmpeg auto-edit fallback (Phase 1 default editor).
+    """FFmpeg auto-edit (Phase 1 default editor).
 
-    - If clips are given, concat them and mux the voiceover.
-    - Else if images are given, make a simple slideshow + voiceover.
-    - Else a color title card + voiceover (same idea as render_video).
+    - Images: Ken Burns zoom/pan, crossfades, dark grade, BGM, burned subtitles.
+    - Clips (optional Grok downloads): concat, then the same finish (BGM + subs).
+    - Else a color title card, then the same finish.
+    Output is 30 fps H.264 + AAC. aspect="9:16" yields 720x1280.
     """
     import shutil
     import time as _time
+
+    from edit_fx import assemble_ken_burns, finalize_program
 
     if not shutil.which("ffmpeg"):
         raise RuntimeError("ffmpeg is not installed")
@@ -400,9 +266,10 @@ async def assemble_video(
     await _emit(log, "terminal", "FFmpeg", f"Assembling {out.name} ({size})")
 
     duration = max(int(duration_seconds), 8)
-    audio_args: list[str] = []
-    if audio_path and Path(audio_path).is_file():
-        audio_args = ["-i", str(audio_path)]
+    audio = Path(audio_path) if audio_path and Path(audio_path).is_file() else None
+    if cues is None and audio is not None:
+        cues = load_cues(audio)
+    script = script or title
 
     async def _run(cmd: list[str]) -> tuple[int, str]:
         proc = await asyncio.create_subprocess_exec(
@@ -414,69 +281,107 @@ async def assemble_video(
     clips = [Path(c) for c in (clips or []) if Path(c).is_file()]
     images = [Path(i) for i in (images or []) if Path(i).is_file()]
 
-    if clips:
+    # Stills are the default (Pollinations). Prefer them over any leftover clips.
+    if images:
         try:
-            return await assemble_clips(
-                clips,
-                audio_path=Path(audio_path) if audio_path else None,
-                dest=out,
+            result = await assemble_ken_burns(
+                images,
+                out,
+                voice=audio,
+                cues=cues or [],
+                script=script,
                 size=size,
                 duration_seconds=duration,
                 log=log,
             )
+            record_usage(task_type="video", status="ok", details=str(out), provider="ffmpeg", model="kenburns")
+            return result
+        except Exception as exc:
+            logger.warning("Ken Burns assemble failed, falling back: %s", exc)
+            await _emit(log, "system", "FFmpeg stills", f"Ken Burns fail ({exc}); fallback")
+
+    if clips:
+        try:
+            stitched = out.parent / f".clips_{out.stem}.mp4"
+            raw = await assemble_clips(
+                clips,
+                audio_path=None,  # finalize_program muxes voice + BGM + subs
+                dest=stitched,
+                size=size,
+                duration_seconds=duration,
+                log=log,
+            )
+            picture = Path(raw["video_path"])
+            await finalize_program(
+                picture,
+                out,
+                voice=audio,
+                cues=cues or [],
+                script=script,
+                size=size,
+                log=log,
+            )
+            stitched.unlink(missing_ok=True)
+            record_usage(task_type="video", status="ok", details=str(out), provider="ffmpeg", model="clips")
+            return {"status": "success", "video_path": str(out), "engine": "ffmpeg-clips"}
         except Exception as exc:
             logger.warning("clip assembly failed, falling back: %s", exc)
             await _emit(log, "system", "FFmpeg clips", f"clip stitch fail ({exc}); fallback")
 
-    if images:
-        # One image held for `duration / n` each, scaled to size.
-        per = max(2.0, duration / max(len(images), 1))
-        # Use the first image as a simple Ken-Burns-less still sequence via lavfi is complex;
-        # a reliable path: loop first image, or concat stills.
-        first = images[0]
-        cmd = [
-            "ffmpeg", "-y",
-            "-loop", "1", "-t", str(duration), "-i", str(first),
-            *audio_args,
-            "-vf", f"scale={size}:force_original_aspect_ratio=decrease,pad={size}:(ow-iw)/2:(oh-ih)/2",
-            "-c:v", "libx264", "-tune", "stillimage", "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "128k",
-            "-shortest", "-movflags", "+faststart",
-            str(out),
-        ]
-        code, err = await _run(cmd)
-        if code == 0 and out.is_file():
-            await _emit(log, "system", "Video ready", f"Saved to {out}")
-            record_usage(task_type="video", status="ok", details=str(out), provider="ffmpeg", model="slideshow")
-            return {"status": "success", "video_path": str(out), "engine": "ffmpeg-image"}
-
+    # Title-card fallback, then still run BGM + subs if we have a voiceover.
     label = _escape_drawtext(title)
+    card = out.parent / f".card_{out.stem}.mp4"
+    audio_args: list[str] = []
+    # Picture only here — audio is mixed in finalize.
     cmd = [
         "ffmpeg", "-y",
         "-f", "lavfi", "-i", f"color=c=0x0a101f:s={size}:d={duration}",
-        *audio_args,
         "-filter_complex",
         f"drawtext=text='{label}':fontcolor=white:fontsize=36:x=(w-text_w)/2:y=(h-text_h)/2",
         "-c:v", "libx264", "-tune", "stillimage", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "128k",
-        "-shortest", "-movflags", "+faststart",
-        str(out),
+        "-an", "-r", "30",
+        "-movflags", "+faststart",
+        str(card),
     ]
     code, err = await _run(cmd)
     if code != 0:
         cmd = [
             "ffmpeg", "-y",
             "-f", "lavfi", "-i", f"color=c=0x0a101f:s={size}:d={duration}",
-            *audio_args,
             "-c:v", "libx264", "-tune", "stillimage", "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "128k",
-            "-shortest", "-movflags", "+faststart",
-            str(out),
+            "-an", "-r", "30",
+            "-movflags", "+faststart",
+            str(card),
         ]
         code, err = await _run(cmd)
         if code != 0:
             raise RuntimeError(err or "ffmpeg title-card failed")
-
+    try:
+        await finalize_program(
+            card,
+            out,
+            voice=audio,
+            cues=cues or [],
+            script=script,
+            size=size,
+            duration=float(max(duration, 8)),
+            log=log,
+        )
+        card.unlink(missing_ok=True)
+    except Exception as exc:
+        logger.warning("title-card finalize failed (%s); copying raw card+voice", exc)
+        if audio:
+            cmd = [
+                "ffmpeg", "-y", "-i", str(card), "-i", str(audio),
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "160k",
+                "-shortest", "-movflags", "+faststart",
+                str(out),
+            ]
+            code, err = await _run(cmd)
+            if code != 0:
+                raise RuntimeError(err or "title-card mux failed") from exc
+        else:
+            shutil.copy2(card, out)
     await _emit(log, "system", "Video ready", f"Saved to {out}")
     record_usage(task_type="video", status="ok", details=str(out), provider="ffmpeg", model="titlecard")
     return {"status": "success", "video_path": str(out), "engine": "ffmpeg-titlecard"}

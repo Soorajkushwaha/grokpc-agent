@@ -68,6 +68,8 @@ async def ffmpeg_edit(
     aspect: str = "16:9",
     log: Optional[LogFn] = None,
     dest: Optional[Path] = None,
+    cues: Optional[list[dict[str, Any]]] = None,
+    script: str = "",
 ) -> dict[str, Any]:
     result = await assemble_video(
         title=title,
@@ -78,6 +80,8 @@ async def ffmpeg_edit(
         aspect=aspect,
         log=log,
         dest=dest,
+        cues=cues,
+        script=script,
     )
     result["editor"] = "ffmpeg"
     return result
@@ -180,6 +184,8 @@ async def edit_video(
     log: Optional[LogFn] = None,
     dest: Optional[Path] = None,
     prefer_capcut: bool = True,
+    cues: Optional[list[dict[str, Any]]] = None,
+    script: str = "",
 ) -> dict[str, Any]:
     capcut_info: Optional[dict[str, Any]] = None
     media = [p for p in [audio_path, *(images or []), *(clips or [])] if p]
@@ -195,6 +201,8 @@ async def edit_video(
         aspect=aspect,
         log=log,
         dest=dest,
+        cues=cues,
+        script=script,
     )
     if capcut_info:
         result["capcut"] = capcut_info

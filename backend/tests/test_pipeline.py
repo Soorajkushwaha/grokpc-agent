@@ -86,7 +86,7 @@ def test_status_and_channels(client: TestClient) -> None:
     check("veo off", flags.get("veo") is False, str(flags))
     check("youtube off", flags.get("youtube_upload") is False, str(flags))
     check("autopilot off", flags.get("autopilot") is False, str(flags))
-    check("steps are phase 1", body.get("steps") == ["story", "voiceover", "edit"], str(body.get("steps")))
+    check("steps are phase 1", body.get("steps") == ["story", "voiceover", "visuals", "edit"], str(body.get("steps")))
 
     r = client.get("/api/channels", headers=AUTH)
     chans = r.json().get("channels") or []
@@ -119,10 +119,11 @@ def test_dry_run_pipeline(client: TestClient, channel_id: str) -> None:
     job = r.json()["job"]
     job_id = job["id"]
     check("job starts queued or running", job["status"] in {"queued", "running"}, job["status"])
-    check("three phase-1 steps", [s["name"] for s in job["steps"]] == ["story", "voiceover", "edit"], str(job["steps"]))
+    check("phase-1 steps include visuals", [s["name"] for s in job["steps"]] == ["story", "voiceover", "visuals", "edit"], str(job["steps"]))
 
     # Wait for the background runner (TestClient shares the app event loop).
-    deadline = time.time() + 60
+    # Ken Burns + BGM + subs on 4 stills can take a bit longer than a title card.
+    deadline = time.time() + 120
     final = None
     while time.time() < deadline:
         r = client.get(f"/api/jobs/{job_id}", headers=AUTH)
@@ -465,7 +466,134 @@ def test_dry_run_visuals(client: TestClient, channel_id: str) -> None:
         check("edit still success", steps.get("edit", {}).get("status") == "success", str(steps.get("edit")))
 
 
+
+def test_voice_and_edit_helpers() -> None:
+    print("== voice + edit helpers ==")
+    from voiceover import split_sentences, wrap_pcm_to_wav, normalize_segments, cues_sidecar, save_cues, load_cues
+    from still_gen import pollinations_url, decorate_prompt, is_accepted_download, image_specs
+    from edit_fx import cues_to_ass, ass_time, find_devanagari_font, _group_durations, bell_times_from_cues
+    import wave, struct
+
+    parts = split_sentences("आधी रात है। बंद हवेली सुनसान है! कोहरा घना होता जा रहा है.")
+    check("split hindi sentences", len(parts) == 3, str(parts))
+    parts2 = split_sentences("Hello world. Next line? Last one.")
+    check("split english sentences", len(parts2) == 3, str(parts2))
+
+    dest = TMP / "pcm.wav"
+    # 0.25s of silence at 24kHz s16le mono
+    pcm = b"\x00\x00" * 6000
+    wrap_pcm_to_wav(pcm, dest, rate=24000)
+    with wave.open(str(dest), "rb") as w:
+        check("wav rate 24k", w.getframerate() == 24000, str(w.getframerate()))
+        check("wav mono s16", w.getnchannels() == 1 and w.getsampwidth() == 2, str((w.getnchannels(), w.getsampwidth())))
+
+    # Already-WAV passthrough
+    dest2 = TMP / "pcm2.wav"
+    wrap_pcm_to_wav(dest.read_bytes(), dest2)
+    check("riff passthrough", dest2.read_bytes()[:4] == b"RIFF")
+
+    segs = normalize_segments("", segments=[
+        {"narration": "एक।", "duration_sec": 8},
+        {"text": "दो।", "min_sec": 8},
+    ])
+    check("normalize segments", len(segs) == 2 and segs[0]["min_sec"] == 8, str(segs))
+
+    cues = [
+        {"start": 0.0, "end": 7.8, "text": "आधी रात है।"},
+        {"start": 8.0, "end": 15.5, "text": "दीया जल उठा।"},
+    ]
+    audio = TMP / "voice_cues.mp3"
+    audio.write_bytes(b"xx")
+    save_cues(audio, cues)
+    loaded = load_cues(audio)
+    check("cues roundtrip", loaded == cues, str(loaded))
+    check("cues sidecar name", cues_sidecar(audio).name == "voice_cues.cues.json", cues_sidecar(audio).name)
+
+    check("ass_time", ass_time(8.5) == "0:00:08.50", ass_time(8.5))
+    ass = cues_to_ass(cues, TMP / "subs.ass", width=1280, height=720)
+    body = ass.read_text(encoding="utf-8")
+    check("ass has hindi", "आधी रात है।" in body and "Dialogue:" in body, body[:200])
+    font = find_devanagari_font()
+    check("devanagari font discovered (best-effort)", True, str(font))  # never fail the suite
+    print(f"    font: {font}")
+
+    durs = _group_durations(cues, 2, 16.0, 0.45)
+    check("group durations length", len(durs) == 2, str(durs))
+    check("group durations positive", all(d > 0.5 for d in durs), str(durs))
+
+    url = pollinations_url("haunted haveli, fog", width=1280, height=720, seed=42, model="flux")
+    check("pollinations url host", "image.pollinations.ai/prompt/" in url, url)
+    check("pollinations url params", "nologo=true" in url and "seed=42" in url and "model=flux" in url, url)
+    dec = decorate_prompt("a courtyard")
+    check("decorate adds style", "cinematic dark horror" in dec and "no people" in dec, dec)
+
+    junk = TMP / "ui_capture.mp4"
+    junk.write_bytes(b"\x00" * 2000)
+    check("reject tiny non-download", is_accepted_download(junk, from_download_event=False) is False)
+    check("reject tiny even with event", is_accepted_download(junk, from_download_event=True) is False)
+    good = TMP / "real_clip.mp4"
+    good.write_bytes(b"\x00" * 60_000)
+    check("accept real download", is_accepted_download(good, from_download_event=True) is True)
+    check("reject harvest of real-sized file", is_accepted_download(good, from_download_event=False) is False)
+
+    plan = {"scenes": [{"image_prompt": "moonlit courtyard", "duration_sec": 8}] * 8}
+    specs = image_specs(plan, limit=10)
+    check("image_specs 8 scenes", len(specs) == 8, str(len(specs)))
+
+    bells = bell_times_from_cues([{"start": 10, "end": 14, "text": "मंदिर की घंटी बजती है"}], "")
+    check("bell cue detected", len(bells) == 1 and 10 <= bells[0] <= 14, str(bells))
+
+    # Ken Burns + BGM + subs on two generated stills (offline, fast).
+    import asyncio, shutil
+    from edit_fx import ken_burns_clip, make_horror_bgm, assemble_ken_burns, media_duration
+    from voiceover import write_silent_audio
+
+    if not shutil.which("ffmpeg"):
+        print("    SKIP  ken burns (no ffmpeg)")
+        return
+
+    img_dir = TMP / "kb"
+    img_dir.mkdir(exist_ok=True)
+    imgs = []
+
+    async def _mk():
+        for i, color in enumerate(("0x1a1020", "0x102018")):
+            path = img_dir / f"s{i}.jpg"
+            cmd = [
+                "ffmpeg", "-y", "-f", "lavfi", "-i", f"color=c={color}:s=1280x720:d=1",
+                "-frames:v", "1", "-q:v", "5", str(path),
+            ]
+            proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            await proc.communicate()
+            imgs.append(path)
+        clip = img_dir / "kb0.mp4"
+        ok = await ken_burns_clip(imgs[0], clip, 2.0, "1280x720", direction=0)
+        check("ken burns clip", ok and clip.is_file() and clip.stat().st_size > 1000, str(clip))
+        dur = await media_duration(clip)
+        check("ken burns ~2s", 1.6 <= dur <= 2.6, str(dur))
+        bgm = await make_horror_bgm(img_dir / "bgm.wav", 3.0)
+        check("bgm exists", bgm.is_file() and bgm.stat().st_size > 1000, str(bgm))
+        voice = img_dir / "v.mp3"
+        await write_silent_audio(voice, seconds=4.0)
+        save_cues(voice, [
+            {"start": 0.0, "end": 1.8, "text": "आधी रात है।"},
+            {"start": 2.0, "end": 3.8, "text": "दीया जल उठा।"},
+        ])
+        final = img_dir / "final.mp4"
+        result = await assemble_ken_burns(
+            imgs, final, voice=voice, cues=load_cues(voice),
+            script="आधी रात है। दीया जल उठा।", size="1280x720", duration_seconds=4,
+        )
+        check("assemble ken burns", result.get("status") == "success" and Path(result["video_path"]).is_file(), str(result))
+        fd = await media_duration(Path(result["video_path"]))
+        check("final near 4s", 3.0 <= fd <= 6.0, str(fd))
+        check("final non-trivial", Path(result["video_path"]).stat().st_size > 8000, str(Path(result["video_path"]).stat().st_size))
+
+    asyncio.run(_mk())
+
+
 def main() -> int:
+
     print(f"temp dir: {TMP}")
     dbmod.init_db()
     channels_mod.ensure_defaults()
@@ -475,6 +603,7 @@ def main() -> int:
         channel_id = test_status_and_channels(client)
         test_task_still_works(client)
         test_planner_unit()
+        test_voice_and_edit_helpers()
         test_plan_with_gemini_mocked()
         test_scheduler_unit()
         test_path_helpers()

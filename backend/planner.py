@@ -41,19 +41,22 @@ Return ONLY one JSON object (no markdown) with this exact shape:
   "scenes": [
     {
       "id": 1,
-      "narration": "what the voice says in this scene",
+      "narration": "what the voice says in this scene (channel language, 1-2 slow sentences, ~8 seconds spoken)",
       "visual": "what we see",
-      "image_prompt": "detailed image generation prompt, English is ok",
+      "image_prompt": "detailed English still-image prompt, same setting across scenes, no text in the image",
       "video_prompt": "detailed video/motion prompt",
-      "duration_sec": 5
+      "duration_sec": 8
     }
   ],
-  "voiceover_script": "full voiceover, ready to be read aloud, in the channel language",
+  "voiceover_script": "full voiceover, ready to be read aloud, in the channel language, slow horror-storyteller pace",
   "thumbnail_prompt": "thumbnail image prompt",
   "tags": ["tag1", "tag2"],
   "description": "YouTube description, 2-4 short paragraphs, with a CTA"
 }
-Use 4 to 8 scenes. duration_sec should sum to a sensible short video (30-90s unless asked otherwise).
+Use 6 to 10 scenes; prefer exactly 8 scenes of about 8 seconds each (~64 seconds total) unless the user asks otherwise.
+Every image_prompt must be English, photorealistic, cinematic, and consistent: same haunted Indian haveli, same night (until a final dawn if the story calls for it), same architecture. Do not put text, watermarks, logos, or letters in the image.
+Safety: fear comes only from atmosphere (fog, moonlight, shadow, a distant animal). No people, no faces, no children, no blood, no gore, no weapons.
+Each scene narration should be speakable slowly in about 8 seconds. duration_sec should be 8 unless a scene genuinely needs more.
 """
 
 
@@ -111,6 +114,108 @@ def mock_plan(topic: str, channel: Optional[dict[str, Any]] = None) -> dict[str,
     }
 
 
+
+def themed_fallback_plan(topic: str, channel: Optional[dict[str, Any]] = None) -> Optional[dict[str, Any]]:
+    """A carefully written 8-scene plan for the haunted-haveli + bear story.
+
+    Used only when live planners fail, so a known topic still gets on-theme
+    visuals instead of the generic educational mock.
+    """
+    blob = f"{topic or ''}".lower()
+    if not any(k in blob for k in ("हवेली", "haveli", "haveli")):
+        return None
+    if not any(k in blob for k in ("भालू", "bhaalu", "bhalu", "bear")):
+        return None
+    lang = (channel or {}).get("language") or "Hindi"
+    scenes = [
+        {
+            "id": 1,
+            "narration": "आधी रात है। बंद हवेली का आँगन सुनसान पड़ा है, चाँद की ठंडी रोशनी टूटी दीवारों पर गिर रही है।",
+            "visual": "Abandoned Indian haveli courtyard at midnight, cold moonlight, one unlit diya on a stone ledge.",
+            "image_prompt": "Abandoned old Indian haveli at midnight, empty courtyard, cold blue moonlight on carved sandstone pillars, a single unlit clay oil lamp (diya) on a stone ledge, thick quiet, photorealistic cinematic wide shot",
+            "video_prompt": "Slow dolly-in through an empty moonlit haveli courtyard toward an unlit diya",
+            "duration_sec": 8,
+        },
+        {
+            "id": 2,
+            "narration": "पत्थर की सीढ़ी पर रखा दीया अचानक अपने आप जल उठता है, और उसकी छोटी लौ में परछाइयाँ काँपने लगती हैं।",
+            "visual": "The diya lights by itself; a small warm flame flickers, shadows stretch on carved pillars.",
+            "image_prompt": "Close cinematic shot of a clay diya on a carved stone ledge inside an Indian haveli, flame just coming to life by itself, warm orange glow against cold moonlight, long shadows on pillars, no people",
+            "video_prompt": "The unlit diya catches flame by itself, warm light spreading over stone",
+            "duration_sec": 8,
+        },
+        {
+            "id": 3,
+            "narration": "कोहरा घना होता जा रहा है, टूटे दरवाज़े और मेहराब धीरे-धीरे धुंध में डूब रहे हैं।",
+            "visual": "Fog thickens and rolls through the broken courtyard, swallowing steps and arches.",
+            "image_prompt": "Thick volumetric fog rolling through a broken Indian haveli courtyard at night, swallowing stone steps and arches, a distant small diya glow barely visible, moonlight beams in the mist, photorealistic",
+            "video_prompt": "Fog pouring through the courtyard, swallowing arches",
+            "duration_sec": 8,
+        },
+        {
+            "id": 4,
+            "narration": "कोहरे के पर्दे से एक विशाल काला भालू धीरे-धीरे निकलता है, फाटक पर उसकी भारी परछाई रुक जाती है।",
+            "visual": "A huge black bear slowly emerges from the fog at the gate, massive silhouette, no attack.",
+            "image_prompt": "A huge black sloth bear emerging slowly from thick fog at the carved wooden gate of an old Indian haveli at midnight, massive silhouette, no attack, photorealistic wildlife, cinematic low angle, moonlight rim light, no people",
+            "video_prompt": "A huge black bear stepping out of fog at the haveli gate",
+            "duration_sec": 8,
+        },
+        {
+            "id": 5,
+            "narration": "भालू की साँस दीये तक पहुँचती है, और लौ डर के मारे काँपने लगती है।",
+            "visual": "The bear's breath reaches the lamp; the diya flame trembles and bends.",
+            "image_prompt": "Close-up of a trembling clay diya flame bending sideways as if from a large animal's breath, faint fog swirling, dark haveli stone background, a huge blurred bear shape in the deep background, cinematic shallow depth of field",
+            "video_prompt": "Diya flame trembling as a breath of fog rolls past",
+            "duration_sec": 8,
+        },
+        {
+            "id": 6,
+            "narration": "वह अपने पिछले पैरों पर खड़ा हो जाता है, और पूरे चाँद के सामने उसकी विशाल काली आकृति छा जाती है।",
+            "visual": "The bear stands on hind legs, silhouetted against the full moon above the haveli roof.",
+            "image_prompt": "Huge black bear standing on hind legs on a haveli rooftop terrace, silhouetted against a full moon, Indian carved parapet, midnight sky with thin clouds, dramatic rim light, photorealistic cinematic, no people",
+            "video_prompt": "Bear rearing up, silhouetted against the full moon",
+            "duration_sec": 8,
+        },
+        {
+            "id": 7,
+            "narration": "दीया बुझ जाता है। अँधेरे में केवल दो चमकती आँखें रह जाती हैं, और वे भी कोहरे में धीरे-धीरे गायब हो जाती हैं।",
+            "visual": "The diya goes out. In the dark, two glowing animal eyes fade back into the fog.",
+            "image_prompt": "Pitch-dark Indian haveli courtyard after the lamp has gone out, only two faint glowing animal eyes fading into thick fog, no body clearly visible, moonlight almost gone, eerie photorealistic atmosphere, no people",
+            "video_prompt": "The diya extinguishes, two glowing eyes fade into fog",
+            "duration_sec": 8,
+        },
+        {
+            "id": 8,
+            "narration": "सुबह हो चुकी है। आँगन फिर से खाली है, और वही दीया एक बार फिर शांत लौ के साथ जल रहा है।",
+            "visual": "Dawn. Empty courtyard. The same diya burns again in gentle morning light and leftover mist.",
+            "image_prompt": "Dawn over an empty Indian haveli courtyard, soft golden morning light, leftover thin mist, the same clay diya burning gently on the stone ledge, peaceful after the night, photorealistic cinematic wide shot, no people, no bear",
+            "video_prompt": "Gentle dawn, empty courtyard, the diya burning quietly again",
+            "duration_sec": 8,
+        },
+    ]
+    script = " ".join(s["narration"] for s in scenes)
+    return {
+        "title": (topic.strip() or "आधी रात की हवेली")[:80],
+        "hook": "आधी रात है, और बंद हवेली में एक दीया अपने आप जल उठता है।",
+        "story": (
+            "आधी रात एक बंद भारतीय हवेली के सुनसान आँगन में दीया अपने आप जलता है, "
+            "कोहरा घना होता है, और कोहरे से एक विशाल काला भालू निकलता है। "
+            "डर महौल से आता है, खून या हथियार से नहीं। सुबह आँगन खाली होता है "
+            "और वही दीया फिर जल रहा होता है।"
+        ),
+        "scenes": scenes,
+        "voiceover_script": script,
+        "thumbnail_prompt": (
+            "Cinematic thumbnail: huge black bear silhouette against a full moon "
+            "above an Indian haveli, a small diya glowing in the foreground fog, "
+            "no text, photorealistic, dark horror mood"
+        ),
+        "tags": ["हवेली", "भालू", "हॉरर", "आधी रात", "दीया", "कोहरा"],
+        "description": f"{topic.strip()}\n\nएक छोटी हॉरर कहानी — डर महौल से, खून से नहीं।",
+        "language": lang,
+    }
+
+
 def normalize_plan(raw: dict[str, Any], topic: str) -> dict[str, Any]:
     base = mock_plan(topic)
     if not isinstance(raw, dict):
@@ -136,7 +241,7 @@ def normalize_plan(raw: dict[str, Any], topic: str) -> dict[str, Any]:
                     "visual": str(s.get("visual") or "").strip(),
                     "image_prompt": str(s.get("image_prompt") or s.get("visual") or "").strip(),
                     "video_prompt": str(s.get("video_prompt") or "").strip(),
-                    "duration_sec": int(s.get("duration_sec") or 6),
+                    "duration_sec": int(s.get("duration_sec") or 8),
                 }
             )
         if clean:
@@ -423,9 +528,10 @@ async def plan_story(
 
     # Last resort so the pipeline can still produce a draft video offline.
     await _emit("Planner", "API nahi chali, local draft plan use kar raha hoon")
+    plan = themed_fallback_plan(topic, channel) or mock_plan(topic, channel)
     return {
         "status": "fallback",
-        "planner": "mock",
-        "plan": mock_plan(topic, channel),
+        "planner": "fallback",
+        "plan": plan,
         "note": "; ".join(errors) or "no planner available",
     }

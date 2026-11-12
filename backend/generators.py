@@ -26,9 +26,16 @@ from config import (
     DRY_RUN,
     FEATURE_GOOGLE_VIDS,
     FEATURE_GROK_IMAGINE,
+    FEATURE_POLLINATIONS,
     FEATURE_VEO,
     GEMINI_API_KEY,
     MAX_CLIPS_PER_JOB,
+    MAX_IMAGE_SCENES,
+)
+from still_gen import (
+    fake_images,
+    generate_pollinations_images,
+    is_accepted_download,
 )
 
 logger = logging.getLogger("grokpc.generators")
@@ -351,7 +358,7 @@ def _attach_download_saver(page: Any, dest_dir: Path, collected: list[Path]) -> 
     page.on("download", _on_download)
 
 
-async def _harvest_media(page: Any, dest: Path) -> Optional[Path]:
+async def _harvest_media(page: Any, dest: Path, videos_only: bool = True) -> Optional[Path]:
     """Pull a generated <video> (http or blob) or a downloadable <a> into dest."""
     dest.parent.mkdir(parents=True, exist_ok=True)
 
@@ -456,21 +463,28 @@ async def _deterministic_generate(page: Any, prompt: str) -> str:
     return "submitted"
 
 
+def _accepted_from_downloads(collected: list[Path]) -> Optional[Path]:
+    """Only files that arrived via Playwright's download event are trusted."""
+    for path in reversed(list(collected)):
+        if is_accepted_download(Path(path), from_download_event=True):
+            return Path(path)
+    return None
+
+
 async def _wait_for_result(
     page: Any,
     dest: Path,
     collected: list[Path],
     timeout: float,
 ) -> Optional[Path]:
+    # Guard: never harvest a <video> already on the page (Google Vids marketing
+    # template, stock smiling people, logos). Only a real file download counts.
     deadline = asyncio.get_event_loop().time() + max(8.0, timeout)
     last_state: dict[str, Any] = {}
     while asyncio.get_event_loop().time() < deadline:
-        if collected:
-            return collected[-1]
-        harvested = await _harvest_media(page, dest)
-        if harvested and harvested.is_file() and harvested.stat().st_size > 800:
-            collected.append(harvested)
-            return harvested
+        got = _accepted_from_downloads(collected)
+        if got:
+            return got
         try:
             last_state = await _page_state(page)
         except Exception:
@@ -479,7 +493,7 @@ async def _wait_for_result(
             return None
         if last_state.get("no_credits"):
             return None
-        # Try a download button once a video looks ready.
+        # Click Download if a video looks ready, then wait for the download event.
         try:
             vid_n = await page.locator("video").count()
         except Exception:
@@ -487,7 +501,7 @@ async def _wait_for_result(
         if vid_n:
             await _click_named(page, _DOWNLOAD_NAMES, roles=("button", "link"))
         await asyncio.sleep(2.5)
-    return collected[-1] if collected else None
+    return _accepted_from_downloads(collected)
 
 
 def _vision_goal(provider: str, prompt: str) -> str:
@@ -777,7 +791,7 @@ async def generate_media(
     dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
 
-    if not (FEATURE_VEO or FEATURE_GROK_IMAGINE or FEATURE_GOOGLE_VIDS):
+    if not (FEATURE_VEO or FEATURE_GROK_IMAGINE or FEATURE_GOOGLE_VIDS or FEATURE_POLLINATIONS):
         return {
             "status": "skipped",
             "paths": [],
@@ -786,70 +800,96 @@ async def generate_media(
         }
 
     if DRY_RUN:
-        fake = await _fake_clips(plan, dest_dir, log=log)
+        # When a browser clip flag is on (unit tests), keep the fake-clip path.
+        # Default DRY_RUN uses stills so the Ken Burns editor is exercised.
+        if FEATURE_GROK_IMAGINE or FEATURE_GOOGLE_VIDS or FEATURE_VEO:
+            fake = await _fake_clips(plan, dest_dir, log=log)
+        else:
+            fake = await fake_images(plan, dest_dir, log=log)
         fake["gemini_key_present"] = bool(GEMINI_API_KEY)
         return fake
 
-    providers = _provider_list(provider)
-    if not providers:
-        return {"status": "skipped", "paths": [], "provider": "", "note": "no visuals provider enabled"}
-
-    scenes = scene_specs(plan)
-    if not scenes:
-        return {"status": "skipped", "paths": [], "provider": "", "note": "no scene prompts in plan"}
-
-    if agent is None:
-        return {
-            "status": "skipped",
-            "paths": [],
-            "provider": "",
-            "auth": [],
-            "note": "no browser agent — log into Grok / Google in noVNC, then retry",
-        }
-
+    # Optional browser providers (off by default). Only real file-downloads count.
     paths: list[Path] = []
     notes: list[str] = []
     auth: list[str] = []
     used_provider = ""
 
-    remaining = list(scenes)
-    try:
-        async with (await _with_agent_page(agent)) as page:
-            try:
-                page.set_default_timeout(12000)
-            except Exception:
-                pass
-            for name, url in providers:
-                if not remaining:
-                    break
-                await _emit(log, "Visuals", f"Trying {name} for {len(remaining)} scene(s)")
+    providers = _provider_list(provider)
+    scenes = scene_specs(plan)
+    if providers and scenes and agent is not None:
+        remaining = list(scenes)
+        try:
+            async with (await _with_agent_page(agent)) as page:
                 try:
-                    result = await _run_provider(page, name, url, remaining, dest_dir, log)
-                except Exception as exc:
-                    logger.exception("provider %s failed", name)
-                    notes.append(f"{name}: {exc}")
-                    continue
-                status = result.get("status")
-                got = [Path(p) for p in (result.get("paths") or []) if Path(p).is_file()]
-                paths.extend(got)
-                if got:
-                    used_provider = used_provider or name
-                    remaining = remaining[len(got) :]
-                if status == "AUTH_REQUIRED":
-                    msg = LOGIN_MSG.get(name, "login needed in noVNC")
-                    auth.append(name)
-                    notes.append(msg)
-                    await _emit(log, "Visuals", msg)
-                    continue
-                if status == "NO_CREDITS":
-                    notes.append(f"{name}: {result.get('note') or 'no credits, not buying'}")
-                    await _emit(log, "Visuals", notes[-1])
-                    continue
-                if result.get("note"):
-                    notes.append(f"{name}: {result['note']}")
-    except Exception as exc:
-        logger.exception("visuals browser session failed")
-        notes.append(f"browser: {exc}")
+                    page.set_default_timeout(12000)
+                except Exception:
+                    pass
+                for name, url in providers:
+                    if not remaining:
+                        break
+                    await _emit(log, "Visuals", f"Trying {name} for {len(remaining)} scene(s)")
+                    try:
+                        result = await _run_provider(page, name, url, remaining, dest_dir, log)
+                    except Exception as exc:
+                        logger.exception("provider %s failed", name)
+                        notes.append(f"{name}: {exc}")
+                        continue
+                    status = result.get("status")
+                    got = [
+                        Path(p) for p in (result.get("paths") or [])
+                        if is_accepted_download(Path(p), from_download_event=True)
+                    ]
+                    paths.extend(got)
+                    if got:
+                        used_provider = used_provider or name
+                        remaining = remaining[len(got):]
+                    if status == "AUTH_REQUIRED":
+                        msg = LOGIN_MSG.get(name, "login needed in noVNC")
+                        auth.append(name)
+                        notes.append(msg)
+                        await _emit(log, "Visuals", msg)
+                        continue
+                    if status == "NO_CREDITS":
+                        notes.append(f"{name}: {result.get('note') or 'no credits, not buying'}")
+                        await _emit(log, "Visuals", notes[-1])
+                        continue
+                    if result.get("note"):
+                        notes.append(f"{name}: {result['note']}")
+        except Exception as exc:
+            logger.exception("visuals browser session failed")
+            notes.append(f"browser: {exc}")
+    elif providers and agent is None:
+        notes.append("no browser agent for Grok/Vids — using Pollinations")
+
+    # Default free path: Pollinations stills. Use them when we don't have a
+    # full set of trusted downloaded clips (the usual case, flags off).
+    want_stills = FEATURE_POLLINATIONS and (not provider or provider in {"pollinations", "stills", ""})
+    if want_stills and (not paths or len(paths) < 2):
+        aspect_w, aspect_h = 1280, 720
+        try:
+            stills = await generate_pollinations_images(
+                plan,
+                dest_dir / "stills",
+                job_id=job_id,
+                log=log,
+                width=aspect_w,
+                height=aspect_h,
+                limit=MAX_IMAGE_SCENES,
+            )
+        except Exception as exc:
+            logger.exception("pollinations failed")
+            notes.append(f"pollinations: {exc}")
+            stills = {}
+        still_paths = [Path(p) for p in (stills.get("paths") or []) if Path(p).is_file()]
+        if still_paths:
+            # Prefer stills as the default look; drop untrusted/partial browser clips.
+            paths = still_paths
+            used_provider = "pollinations"
+            if stills.get("note"):
+                notes.append(str(stills["note"]))
+        elif stills.get("note"):
+            notes.append(str(stills["note"]))
 
     note = "; ".join(n for n in notes if n)
     if paths:
@@ -858,10 +898,8 @@ async def generate_media(
             "paths": paths,
             "provider": used_provider,
             "auth": auth,
-            "note": note or f"{len(paths)} clips",
+            "note": note or f"{len(paths)} files",
         }
-    # No clips — edit step will use the basic title-card path. This is a
-    # graceful skip, not a job failure.
     if not note:
         note = "no clips; falling back to basic visuals"
     return {
@@ -871,6 +909,7 @@ async def generate_media(
         "auth": auth,
         "note": note,
     }
+
 
 
 # Back-compat alias used in older comments / tests.
