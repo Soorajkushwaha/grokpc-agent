@@ -17,6 +17,9 @@ from config import (
     GEMINI_API_KEY,
     GEMINI_VISION_MODEL,
     MAX_VISION_STEPS,
+    SCREENSHOT_FORMAT,
+    SCREENSHOT_QUALITY,
+    SCREENSHOT_TO_UI,
 )
 from db import record_usage
 
@@ -42,7 +45,8 @@ Rules:
 - "type" types into the currently focused or last-clicked field.
 - "press" uses a key name like Enter, Tab, Escape, Backspace.
 - "scroll" uses amount in pixels (positive = down).
-- "goto" navigates to url.
+- "goto" navigates to url. To open any website, always use "goto" with the full URL.
+- You control ONE tab that is already private (incognito-like). Browser shortcuts for new tabs/windows (Ctrl+T, Ctrl+N, Ctrl+Shift+N) do not work; never use them.
 - "wait" waits amount milliseconds (default 1000).
 - "done" when the task is finished or blocked; put the result in "text".
 """
@@ -207,10 +211,44 @@ async def decide(prompt: str, screenshot_png: bytes, mock: Optional[MockLLM] = N
     raise RuntimeError("No vision LLM configured (set DEEPSEEK_API_KEY or GEMINI_API_KEY, or DRY_RUN=1)")
 
 
+_KEY_ALIASES = {
+    "ctrl": "Control", "control": "Control", "cmd": "Meta", "command": "Meta", "win": "Meta",
+    "windows": "Meta", "super": "Meta", "meta": "Meta", "alt": "Alt", "option": "Alt",
+    "shift": "Shift", "esc": "Escape", "escape": "Escape", "del": "Delete", "delete": "Delete",
+    "enter": "Enter", "return": "Enter", "tab": "Tab", "space": " ", "backspace": "Backspace",
+    "up": "ArrowUp", "down": "ArrowDown", "left": "ArrowLeft", "right": "ArrowRight",
+    "pageup": "PageUp", "pagedown": "PageDown", "home": "Home", "end": "End",
+}
+
+
+def _normalize_key(key: str) -> str:
+    parts = [p.strip() for p in re.split(r"\s*\+\s*", str(key).strip()) if p.strip()]
+    out = []
+    for p in parts:
+        alias = _KEY_ALIASES.get(p.lower())
+        if alias:
+            out.append(alias)
+        elif len(p) == 1:
+            out.append(p.lower() if len(parts) > 1 else p)
+        else:
+            out.append(p[0].upper() + p[1:])
+    return "+".join(out) or "Enter"
+
+
 async def apply_action(page, action: dict[str, Any]) -> str:
+    try:
+        return await _apply_action(page, action)
+    except Exception as exc:  # let the model see the error and try something else
+        logger.warning("action failed: %s", exc)
+        return f"Action failed: {str(exc)[:200]}. Try a different action (e.g. goto with full URL)."
+
+
+async def _apply_action(page, action: dict[str, Any]) -> str:
     kind = (action.get("action") or "done").lower().strip()
     if kind == "goto":
-        url = action.get("url") or ""
+        url = (action.get("url") or "").strip()
+        if url and "://" not in url and not url.startswith("about:"):
+            url = "https://" + url
         await page.goto(url, wait_until="domcontentloaded")
         return f"Navigated to {url}"
     if kind == "click":
@@ -222,7 +260,7 @@ async def apply_action(page, action: dict[str, Any]) -> str:
         await page.keyboard.type(text, delay=20)
         return f"Typed {len(text)} chars"
     if kind == "press":
-        key = action.get("key") or "Enter"
+        key = _normalize_key(action.get("key") or "Enter")
         await page.keyboard.press(key)
         return f"Pressed {key}"
     if kind == "scroll":

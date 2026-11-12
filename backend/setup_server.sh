@@ -196,7 +196,7 @@ else
   pip install -r "$APP_DIR/requirements.txt"
 fi
 python -m playwright install-deps chromium || true
-python -m playwright install chromium
+sudo -u "$INSTALL_USER" -H "$APP_DIR/.venv/bin/python" -m playwright install chromium
 
 GEN_TOKEN=""
 GEN_VNCPW=""
