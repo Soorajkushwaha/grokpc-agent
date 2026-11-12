@@ -2,8 +2,22 @@ import React, { useEffect, useState } from 'react';
 import { useApp } from '../context/AppContext';
 import { BACKEND_OPTIONS, type BackendId, type BackendSlot, type Channel } from '../types';
 import { emptyBackends, isConfigured } from '../api';
-import { Laptop, Tablet, Cloud, Plus, Trash2, ChevronDown } from 'lucide-react';
+import {
+  Laptop,
+  Tablet,
+  Cloud,
+  Plus,
+  Trash2,
+  ChevronDown,
+  Tv,
+  Wallet,
+  PenLine,
+  Wrench,
+  AlertTriangle,
+  Check,
+} from 'lucide-react';
 import { OracleCodeViewer } from '../components/OracleCode/OracleCodeViewer';
+import { channelTheme, initials } from '../ui';
 
 const ICONS: Record<BackendId, React.ReactNode> = {
   laptop: <Laptop className="w-4 h-4" />,
@@ -11,22 +25,28 @@ const ICONS: Record<BackendId, React.ReactNode> = {
   vps: <Cloud className="w-4 h-4" />,
 };
 
-const Section: React.FC<{ title: string; defaultOpen?: boolean; children: React.ReactNode }> = ({
-  title,
-  defaultOpen = false,
-  children,
-}) => {
+const Section: React.FC<{
+  title: string;
+  icon: React.ReactNode;
+  defaultOpen?: boolean;
+  children: React.ReactNode;
+}> = ({ title, icon, defaultOpen = false, children }) => {
   const [open, setOpen] = useState(defaultOpen);
   return (
-    <section className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden">
+    <section className="card overflow-hidden">
       <button
         onClick={() => setOpen((v) => !v)}
-        className="w-full flex items-center justify-between px-4 py-3 text-sm font-semibold text-white cursor-pointer"
+        className="w-full flex items-center justify-between px-3.5 py-3 text-sm font-semibold text-white cursor-pointer min-h-[52px] hover:bg-white/[0.02] transition-colors"
       >
-        {title}
-        <ChevronDown className={`w-4 h-4 text-slate-400 transition ${open ? 'rotate-180' : ''}`} />
+        <span className="flex items-center gap-2.5">
+          <span className="w-8 h-8 rounded-lg bg-slate-800/90 text-cyan-300 flex items-center justify-center">
+            {icon}
+          </span>
+          {title}
+        </span>
+        <ChevronDown className={`w-4 h-4 text-slate-400 transition-transform duration-200 ${open ? 'rotate-180' : ''}`} />
       </button>
-      {open && <div className="px-4 pb-4 space-y-3">{children}</div>}
+      {open && <div className="px-3.5 pb-4 space-y-3 animate-fade-in">{children}</div>}
     </section>
   );
 };
@@ -84,8 +104,13 @@ export const SettingsScreen: React.FC = () => {
 
   return (
     <div className="space-y-3">
-      <section className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3">
-        <h2 className="text-sm font-semibold text-white">Kaunsa machine?</h2>
+      <section className="card p-4 space-y-3">
+        <h2 className="text-sm font-semibold text-white flex items-center gap-2.5 font-heading">
+          <span className="w-8 h-8 rounded-lg bg-slate-800/90 text-cyan-300 flex items-center justify-center">
+            <Laptop className="w-4 h-4" />
+          </span>
+          Kaunsa machine?
+        </h2>
         <div className="grid grid-cols-3 gap-1.5">
           {BACKEND_OPTIONS.map((opt) => {
             const filled = Boolean(backends[opt.id]?.backendUrl && backends[opt.id]?.agentToken);
@@ -95,19 +120,24 @@ export const SettingsScreen: React.FC = () => {
                 key={opt.id}
                 type="button"
                 onClick={() => setActive(opt.id)}
-                className={`flex flex-col items-center gap-0.5 rounded-xl border px-2 py-2 cursor-pointer ${
-                  selected ? 'border-cyan-600 bg-cyan-950/70 text-white' : 'border-slate-800 bg-slate-950 text-slate-300'
+                className={`flex flex-col items-center gap-0.5 rounded-2xl border px-2 py-2 cursor-pointer min-h-[64px] transition-all duration-150 ${
+                  selected
+                    ? 'border-cyan-500/70 bg-cyan-950/70 text-white ring-1 ring-cyan-400/30 shadow-lg shadow-cyan-950/30'
+                    : 'border-white/8 bg-slate-950/70 text-slate-300 hover:border-white/16'
                 }`}
               >
                 {ICONS[opt.id]}
                 <span className="text-xs font-bold">{opt.label}</span>
-                {filled && <span className="text-[9px] text-emerald-400">saved</span>}
+                {filled && <span className="text-[9px] text-emerald-400 font-medium">saved</span>}
               </button>
             );
           })}
         </div>
         {active === 'tablet' && (
-          <p className="text-[11px] text-amber-300">Tablet Phase 2 hai — abhi setup later. Pehle Laptop use karo.</p>
+          <p className="text-[11px] text-amber-300 flex items-start gap-1.5 bg-amber-950/40 border border-amber-800/30 rounded-xl px-2.5 py-2">
+            <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" />
+            Tablet Phase 2 hai — abhi setup later. Pehle Laptop use karo.
+          </p>
         )}
         <label className="block space-y-1">
           <span className="text-[11px] text-slate-400">Backend URL</span>
@@ -115,7 +145,7 @@ export const SettingsScreen: React.FC = () => {
             value={slot.backendUrl}
             onChange={(e) => patchSlot({ backendUrl: e.target.value })}
             placeholder="https://xxxx.trycloudflare.com"
-            className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm text-white font-mono"
+            className="field w-full rounded-xl px-3 py-2 text-sm text-white font-mono min-h-[40px]"
           />
         </label>
         <label className="block space-y-1">
@@ -125,7 +155,7 @@ export const SettingsScreen: React.FC = () => {
             value={slot.agentToken}
             onChange={(e) => patchSlot({ agentToken: e.target.value })}
             placeholder="AGENT_TOKEN"
-            className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm text-white font-mono"
+            className="field w-full rounded-xl px-3 py-2 text-sm text-white font-mono min-h-[40px]"
           />
         </label>
         <label className="block space-y-1">
@@ -134,25 +164,54 @@ export const SettingsScreen: React.FC = () => {
             value={slot.vncUrl}
             onChange={(e) => patchSlot({ vncUrl: e.target.value })}
             placeholder="khali chhodo to /novnc use hoga"
-            className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm text-white font-mono"
+            className="field w-full rounded-xl px-3 py-2 text-sm text-white font-mono min-h-[40px]"
           />
         </label>
         {demoMode && (
-          <p className="text-[11px] text-amber-300">URL + token dono daal ke Save dabao — tab asli video banegi.</p>
+          <p className="text-[11px] text-amber-300 flex items-start gap-1.5 bg-amber-950/40 border border-amber-800/30 rounded-xl px-2.5 py-2">
+            <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" />
+            URL + token dono daal ke Save dabao — tab asli video banegi.
+          </p>
         )}
         <button
           onClick={handleSave}
-          className="w-full py-2.5 rounded-xl bg-cyan-600 text-white text-sm font-bold cursor-pointer"
+          className="w-full py-2.5 min-h-[44px] rounded-2xl bg-gradient-to-r from-cyan-500 to-blue-600 text-white text-sm font-bold cursor-pointer shadow-lg shadow-cyan-900/30 flex items-center justify-center gap-2 hover:brightness-110 transition-all"
         >
-          {saved ? 'Saved' : `Save & use ${BACKEND_OPTIONS.find((b) => b.id === active)?.label}`}
+          {saved ? (
+            <>
+              <Check className="w-4 h-4" /> Saved
+            </>
+          ) : (
+            `Save & use ${BACKEND_OPTIONS.find((b) => b.id === active)?.label}`
+          )}
         </button>
-        <p className="text-[11px] font-mono text-slate-500">
-          {health.connected ? 'connected' : 'offline'} · WS {wsConnected ? 'open' : 'closed'} · {health.hostname}
-          {health.ramTotalGb ? ` · RAM ${health.ramUsedGb}/${health.ramTotalGb}G` : ''}
-        </p>
+        <div className="flex flex-wrap gap-1.5">
+          <span
+            className={`text-[10px] font-medium px-2 py-0.5 rounded-full border ${
+              health.connected
+                ? 'text-emerald-300 bg-emerald-950/50 border-emerald-800/40'
+                : 'text-slate-400 bg-slate-900 border-slate-700'
+            }`}
+          >
+            {health.connected ? 'connected' : 'offline'}
+          </span>
+          <span
+            className={`text-[10px] font-medium px-2 py-0.5 rounded-full border ${
+              wsConnected
+                ? 'text-emerald-300 bg-emerald-950/50 border-emerald-800/40'
+                : 'text-slate-400 bg-slate-900 border-slate-700'
+            }`}
+          >
+            WS {wsConnected ? 'open' : 'closed'}
+          </span>
+          <span className="text-[10px] font-medium px-2 py-0.5 rounded-full border text-slate-400 bg-slate-900 border-slate-700 font-mono">
+            {health.hostname}
+            {health.ramTotalGb ? ` · RAM ${health.ramUsedGb}/${health.ramTotalGb}G` : ''}
+          </span>
+        </div>
       </section>
 
-      <Section title="Channels" defaultOpen>
+      <Section title="Channels" icon={<Tv className="w-4 h-4" />} defaultOpen>
         {channels.map((ch) => (
           <ChannelEditor key={ch.id} channel={ch} onSave={(c) => void saveChannel(c)} onDelete={() => void removeChannel(ch.id)} />
         ))}
@@ -161,7 +220,7 @@ export const SettingsScreen: React.FC = () => {
             value={newName}
             onChange={(e) => setNewName(e.target.value)}
             placeholder="Naya channel naam"
-            className="flex-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm text-white"
+            className="field flex-1 rounded-xl px-3 py-2.5 text-sm text-white min-h-[44px]"
           />
           <button
             onClick={() => {
@@ -169,20 +228,20 @@ export const SettingsScreen: React.FC = () => {
               void saveChannel({ name: newName.trim() });
               setNewName('');
             }}
-            className="px-3 rounded-lg bg-slate-800 text-cyan-300 cursor-pointer"
+            className="w-11 min-w-[44px] min-h-[44px] rounded-xl bg-slate-800 text-cyan-300 cursor-pointer flex items-center justify-center hover:bg-slate-700 transition-colors"
           >
             <Plus className="w-4 h-4" />
           </button>
         </div>
       </Section>
 
-      <Section title="Budget caps & quiet hours">
+      <Section title="Budget caps & quiet hours" icon={<Wallet className="w-4 h-4" />}>
         <label className="block text-[11px] text-slate-400">
           Quiet hours
           <input
             defaultValue={settings?.quiet_hours || '23:00-07:00'}
             onBlur={(e) => void saveSettings({ quiet_hours: e.target.value })}
-            className="mt-1 w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm text-white font-mono"
+            className="field mt-1 w-full rounded-xl px-3 py-2.5 text-sm text-white font-mono min-h-[44px]"
           />
         </label>
         <div className="grid grid-cols-2 gap-2">
@@ -192,7 +251,7 @@ export const SettingsScreen: React.FC = () => {
               type="number"
               defaultValue={settings?.daily_video_cap ?? 3}
               onBlur={(e) => void saveSettings({ daily_video_cap: Number(e.target.value) })}
-              className="mt-1 w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm text-white"
+              className="field mt-1 w-full rounded-xl px-3 py-2.5 text-sm text-white min-h-[44px]"
             />
           </label>
           <label className="block text-[11px] text-slate-400">
@@ -201,7 +260,7 @@ export const SettingsScreen: React.FC = () => {
               type="number"
               defaultValue={settings?.daily_spend_cap_inr ?? 40}
               onBlur={(e) => void saveSettings({ daily_spend_cap_inr: Number(e.target.value) })}
-              className="mt-1 w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm text-white"
+              className="field mt-1 w-full rounded-xl px-3 py-2.5 text-sm text-white min-h-[44px]"
             />
           </label>
         </div>
@@ -211,7 +270,7 @@ export const SettingsScreen: React.FC = () => {
             type="number"
             defaultValue={settings?.idle_seconds ?? 900}
             onBlur={(e) => void saveSettings({ idle_seconds: Number(e.target.value) })}
-            className="mt-1 w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm text-white"
+            className="field mt-1 w-full rounded-xl px-3 py-2.5 text-sm text-white min-h-[44px]"
           />
         </label>
         <p className="text-[11px] text-slate-500">
@@ -219,14 +278,14 @@ export const SettingsScreen: React.FC = () => {
         </p>
       </Section>
 
-      <Section title="Sooraj ka style (planning)">
+      <Section title="Sooraj ka style (planning)" icon={<PenLine className="w-4 h-4" />}>
         <label className="block text-[11px] text-slate-400">
           Tone
           <textarea
             defaultValue={styleProfile?.tone || ''}
             rows={2}
             onBlur={(e) => void saveStyle({ tone: e.target.value })}
-            className="mt-1 w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm text-white"
+            className="field mt-1 w-full rounded-xl px-3 py-2.5 text-sm text-white"
           />
         </label>
         <label className="block text-[11px] text-slate-400">
@@ -235,12 +294,12 @@ export const SettingsScreen: React.FC = () => {
             defaultValue={styleProfile?.thinking_style || ''}
             rows={3}
             onBlur={(e) => void saveStyle({ thinking_style: e.target.value })}
-            className="mt-1 w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm text-white"
+            className="field mt-1 w-full rounded-xl px-3 py-2.5 text-sm text-white"
           />
         </label>
       </Section>
 
-      <Section title="Advanced">
+      <Section title="Advanced" icon={<Wrench className="w-4 h-4" />}>
         <p className="text-[11px] text-slate-500">
           Phase {status?.phase ?? 1}. Features:{' '}
           {Object.entries(status?.features || {})
@@ -281,32 +340,41 @@ const ChannelEditor: React.FC<{
     setStyle(channel.style);
     setAspect(channel.aspect);
   }, [channel]);
+  const theme = channelTheme(channel.id);
   return (
-    <div className="border border-slate-800 rounded-xl p-2">
+    <div className="border border-white/8 rounded-xl p-2 bg-slate-950/40">
       <div className="flex items-center gap-2">
-        <button onClick={() => setOpen((v) => !v)} className="flex-1 text-left text-sm text-white cursor-pointer">
-          {channel.name}
+        <button onClick={() => setOpen((v) => !v)} className="flex-1 flex items-center gap-2.5 text-left text-sm text-white cursor-pointer min-h-[40px] px-1">
+          <span className={`w-7 h-7 rounded-lg ${theme.solid} text-white text-[10px] font-bold flex items-center justify-center shrink-0`}>
+            {initials(channel.name)}
+          </span>
+          <span className="min-w-0">
+            <span className="block truncate font-medium">{channel.name}</span>
+            <span className="block text-[10px] text-slate-500">
+              {channel.language} · {channel.aspect}
+            </span>
+          </span>
         </button>
-        <button onClick={onDelete} className="p-1 text-slate-500 hover:text-rose-400 cursor-pointer" title="Delete">
+        <button onClick={onDelete} className="p-2 min-w-[36px] min-h-[36px] text-slate-500 hover:text-rose-400 cursor-pointer" title="Delete">
           <Trash2 className="w-3.5 h-3.5" />
         </button>
       </div>
       {open && (
-        <div className="mt-2 space-y-2">
-          <input value={name} onChange={(e) => setName(e.target.value)} className="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1.5 text-sm text-white" />
-          <input value={niche} onChange={(e) => setNiche(e.target.value)} placeholder="Niche" className="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1.5 text-sm text-white" />
+        <div className="mt-2 space-y-2 animate-fade-in">
+          <input value={name} onChange={(e) => setName(e.target.value)} className="field w-full rounded-lg px-2.5 py-2 text-sm text-white" />
+          <input value={niche} onChange={(e) => setNiche(e.target.value)} placeholder="Niche" className="field w-full rounded-lg px-2.5 py-2 text-sm text-white" />
           <div className="flex gap-2">
-            <input value={language} onChange={(e) => setLanguage(e.target.value)} className="flex-1 bg-slate-950 border border-slate-800 rounded px-2 py-1.5 text-sm text-white" />
-            <select value={aspect} onChange={(e) => setAspect(e.target.value)} className="bg-slate-950 border border-slate-800 rounded px-2 py-1.5 text-sm text-white">
+            <input value={language} onChange={(e) => setLanguage(e.target.value)} className="field flex-1 rounded-lg px-2.5 py-2 text-sm text-white" />
+            <select value={aspect} onChange={(e) => setAspect(e.target.value)} className="field rounded-lg px-2.5 py-2 text-sm text-white">
               <option value="16:9">16:9</option>
               <option value="9:16">9:16</option>
               <option value="1:1">1:1</option>
             </select>
           </div>
-          <input value={style} onChange={(e) => setStyle(e.target.value)} placeholder="Style" className="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1.5 text-sm text-white" />
+          <input value={style} onChange={(e) => setStyle(e.target.value)} placeholder="Style" className="field w-full rounded-lg px-2.5 py-2 text-sm text-white" />
           <button
             onClick={() => onSave({ ...channel, name, niche, language, style, aspect })}
-            className="text-xs text-cyan-400 cursor-pointer"
+            className="text-xs font-semibold text-cyan-400 cursor-pointer px-1 py-1"
           >
             Save channel
           </button>
