@@ -4,7 +4,7 @@ Mobile control center + self-hosted backend that plans, voices, and edits YouTub
 
 **Frontend** (`frontend/`): Vite + React PWA at [https://grokpc-agent.simple-sooraj.workers.dev](https://grokpc-agent.simple-sooraj.workers.dev)
 
-**Backend** (`backend/`): FastAPI + Playwright vision loop (DeepSeek Flash, Gemini fallback) + a Phase 1 video pipeline (ChatGPT/DeepSeek planning → voiceover → FFmpeg, with an optional Windows CapCut helper).
+**Backend** (`backend/`): FastAPI + Playwright vision loop (DeepSeek Flash, Gemini fallback) + a video pipeline (planning → voiceover → Grok Imagine / Google Vids clips → FFmpeg, with an optional Windows CapCut helper).
 
 ## Phase 1 (now) vs Phase 2 (flags off)
 
@@ -17,7 +17,8 @@ Mobile control center + self-hosted backend that plans, voices, and edits YouTub
 | FFmpeg auto-edit (always produces a final MP4) | 1 | on |
 | Windows desktop helper for CapCut (launch + import folder) | 1 | on if helper is running |
 | Browser vision `/api/task` (YouTube etc.) | 1 | on, unchanged |
-| Veo / Grok Imagine generation + credit checks | 2 | `FEATURE_VEO=0`, `FEATURE_GROK_IMAGINE=0`, `FEATURE_CREDIT_CHECK=0` |
+| Grok Imagine + Google Vids visuals (login in noVNC; falls back if needed) | 1 | `FEATURE_GROK_IMAGINE=1`, `FEATURE_GOOGLE_VIDS=1` |
+| Veo generation + billing-page credit scrape | 2 | `FEATURE_VEO=0`, `FEATURE_CREDIT_CHECK=0` |
 | YouTube Studio upload + approve-publish | 2 | `FEATURE_YOUTUBE_UPLOAD=0` |
 | Autopilot (idle / quiet hours / daily caps) | 2 | `FEATURE_AUTOPILOT=0` |
 | Google AI Studio voice in the browser | 2 | `FEATURE_AISTUDIO_VOICE=0` |
@@ -28,12 +29,13 @@ Mobile control center + self-hosted backend that plans, voices, and edits YouTub
 1. Phone pe app kholo. **Home** pe channel chuno, topic likho, **Nayi Video Banao**.
 2. Agent **Kahani** likhta hai — pehle ChatGPT (Chrome profile, ek baar noVNC se login), na ho to DeepSeek API (key pehle se laptop pe hai).
 3. **Awaz** banati hai — free gTTS, ya Gemini TTS agar `USE_GEMINI_TTS=1` aur key ho.
-4. **Edit** — FFmpeg se final MP4. Agar Windows helper chal raha hai aur CapCut installed hai, CapCut khul jata hai aur media `Videos\GrokPC\import` me aa jata hai. CapCut ka automatic timeline edit reliable nahi (koi official API nahi), isliye FFmpeg wali file hamesha ready rehti hai.
-5. **Videos** tab me har job ke steps dikhte hain: Pause / Resume / Cancel.
-6. **Screen** tab me noVNC + wahi purana “browser ko bolo” box (`/api/task`).
-7. Auto mode, Veo, Grok Imagine, YouTube public upload — **Phase 2**, abhi band. Final file laptop pe `/data/outputs` (ya `OUTPUT_DIR`) me milti hai.
+4. **Visual** — PC ka Chrome `grok.com/imagine` aur `vids.google.com` kholta hai, har scene ka clip banwata hai aur download karta hai. Login, credits, ya timeout fail ho to FFmpeg ke basic visuals use hote hain. Kabhi credits kharidta nahi.
+5. **Edit** — FFmpeg clips ko awaaz ke saath jod ke final MP4 banata hai. Agar Windows helper chal raha hai aur CapCut installed hai, CapCut khul jata hai aur media `Videos\GrokPC\import` me aa jata hai. CapCut ka automatic timeline edit reliable nahi (koi official API nahi), isliye FFmpeg wali file hamesha ready rehti hai.
+6. **Videos** tab me har job ke steps dikhte hain: Pause / Resume / Cancel.
+7. **Screen** tab me noVNC + wahi purana “browser ko bolo” box (`/api/task`).
+8. Auto mode, Veo, YouTube public upload — **Phase 2**, abhi band. Final file laptop pe `/data/outputs` (ya `OUTPUT_DIR`) me milti hai.
 
-Ek baar ka login (Screen / noVNC me, apna Chrome profile): ChatGPT, aur baad me Phase 2 ke liye Google AI Studio, Gemini/Flow, grok.com, YouTube Studio.
+Ek baar ka login (Screen / noVNC me, apna Chrome profile): ChatGPT, **Grok Imagine** (`grok.com/imagine`) aur **Google Vids** (`vids.google.com`) taaki Visual step clips bana sake. Baad me Phase 2 ke liye Google AI Studio, Gemini/Flow, YouTube Studio.
 
 ## Quick start (frontend)
 

@@ -181,7 +181,8 @@ export interface StyleProfile {
 export const STEP_LABELS: Record<string, string> = {
   story: 'Kahani',
   voiceover: 'Awaz',
-  generate: 'Video gen',
+  visuals: 'Visual',
+  generate: 'Visual',
   edit: 'Edit',
   upload: 'Upload',
 };

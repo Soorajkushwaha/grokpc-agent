@@ -28,6 +28,8 @@ os.environ.update(
         "RUNTIME_SETTINGS_PATH": str(TMP / "settings.json"),
         "WINDOWS_HELPER_URL": "http://127.0.0.1:1",
         "FEATURE_VEO": "0",
+        "FEATURE_GROK_IMAGINE": "0",
+        "FEATURE_GOOGLE_VIDS": "0",
         "FEATURE_YOUTUBE_UPLOAD": "0",
         "FEATURE_AUTOPILOT": "0",
     }

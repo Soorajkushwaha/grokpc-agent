@@ -14,6 +14,7 @@ import {
   ChevronRight,
 } from 'lucide-react';
 import { channelTheme, initials } from '../ui';
+import { STEP_LABELS } from '../types';
 
 const TOPIC_CHIPS: { label: string; Icon: React.ComponentType<{ className?: string }> }[] = [
   { label: 'Horror kahani', Icon: Ghost },
@@ -157,7 +158,7 @@ export const HomeScreen: React.FC = () => {
           <span className="min-w-0 flex-1">
             <span className="block text-[11px] uppercase tracking-wide text-cyan-400 font-semibold">Abhi chal raha hai</span>
             <span className="block text-sm text-white font-medium truncate">{running.topic}</span>
-            <span className="block text-[11px] text-slate-400">{running.current_step} · {running.status}</span>
+            <span className="block text-[11px] text-slate-400">{STEP_LABELS[running.current_step] || running.current_step} · {running.status}</span>
           </span>
           <ChevronRight className="w-4 h-4 text-slate-500 shrink-0" />
         </button>

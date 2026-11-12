@@ -341,6 +341,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         steps: [
           { name: 'story', status: 'success', detail: 'demo' },
           { name: 'voiceover', status: 'success', detail: 'demo' },
+          { name: 'visuals', status: 'skipped', detail: 'demo — login ke baad asli clips' },
           { name: 'edit', status: 'success', detail: 'demo' },
         ],
         created_at: new Date().toISOString(),

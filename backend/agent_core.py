@@ -4,7 +4,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from typing import Any, Awaitable, Callable, Optional
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 
 from playwright.async_api import BrowserContext, Page, async_playwright
 
@@ -120,6 +121,34 @@ class BrowserAgentCore:
             await self.playwright.stop()
             self.playwright = None
         self._external_browser = False
+
+    @asynccontextmanager
+    async def exclusive_page(self) -> AsyncIterator[Page]:
+        """Yield a fresh tab on the existing persistent profile.
+
+        Holds the agent lock so the vision loop and the visuals step never
+        launch a second persistent context (Chromium would refuse the profile).
+        """
+        async with self._lock:
+            self.is_busy = True
+            page: Optional[Page] = None
+            try:
+                await self.initialize_browser()
+                if self.context is None:
+                    raise RuntimeError("browser context was not created")
+                page = await self.context.new_page()
+                try:
+                    await page.set_viewport_size({"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT})
+                except Exception:
+                    pass
+                yield page
+            finally:
+                if page is not None:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+                self.is_busy = False
 
     async def run_generic_task(self, task: str, mock: Optional[MockLLM] = None) -> dict[str, Any]:
         async with self._lock:

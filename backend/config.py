@@ -123,20 +123,27 @@ SCREENSHOT_QUALITY = int(os.getenv("SCREENSHOT_QUALITY", "45"))
 SCREENSHOT_TO_UI = _bool("SCREENSHOT_TO_UI", not ANDROID)
 
 # ---------------------------------------------------------------------------
-# Phase flags. Phase 2 defaults OFF so a laptop restart on new code keeps
-# the current working path (browser vision + FFmpeg pipeline) without
-# touching live sites we have not tested.
+# Phase flags. YouTube / Veo / autopilot stay off until tested. Grok Imagine
+# and Google Vids (visuals step) default ON and fall back to FFmpeg if the
+# browser is not logged in, credits are missing, or generation times out.
 # ---------------------------------------------------------------------------
-# Phase 1 (on): ChatGPT/Gemini/DeepSeek planning, voiceover, FFmpeg edit, CapCut helper, jobs API.
+# Phase 1 (on): ChatGPT/Gemini/DeepSeek planning, voiceover, visuals, FFmpeg edit, CapCut helper, jobs API.
 FEATURE_CAPCUT = _bool("FEATURE_CAPCUT", True)
 FEATURE_CHATGPT_PLANNER = _bool("FEATURE_CHATGPT_PLANNER", True)
-# Phase 2 (off until tested): paid/web video gen, YouTube, autopilot, credit scrape, AI Studio voice.
+# Still-off until tested: Veo API, YouTube, autopilot, billing-page scrape, AI Studio voice.
 FEATURE_VEO = _bool("FEATURE_VEO", False)
-FEATURE_GROK_IMAGINE = _bool("FEATURE_GROK_IMAGINE", False)
+# Visuals step: Grok Imagine + Google Vids. Default ON; if not logged in or
+# out of free credits, the pipeline falls back to the existing FFmpeg title card.
+FEATURE_GROK_IMAGINE = _bool("FEATURE_GROK_IMAGINE", True)
+FEATURE_GOOGLE_VIDS = _bool("FEATURE_GOOGLE_VIDS", True)
 FEATURE_YOUTUBE_UPLOAD = _bool("FEATURE_YOUTUBE_UPLOAD", False)
 FEATURE_AUTOPILOT = _bool("FEATURE_AUTOPILOT", False)
 FEATURE_CREDIT_CHECK = _bool("FEATURE_CREDIT_CHECK", False)
 FEATURE_AISTUDIO_VOICE = _bool("FEATURE_AISTUDIO_VOICE", False)
+
+# Caps for the visuals step (never buy credits; fall back when these are hit).
+MAX_CLIPS_PER_JOB = int(os.getenv("MAX_CLIPS_PER_JOB", "4"))
+CLIP_TIMEOUT_SEC = int(os.getenv("CLIP_TIMEOUT_SEC", "240"))
 
 # Windows desktop helper (Phase 1, optional). WSL2 localhost forwarding reaches
 # a Windows process bound to 127.0.0.1 (already enabled in windows/install.ps1).
@@ -190,6 +197,7 @@ def feature_flags() -> dict[str, bool]:
         "chatgpt_planner": FEATURE_CHATGPT_PLANNER,
         "veo": FEATURE_VEO,
         "grok_imagine": FEATURE_GROK_IMAGINE,
+        "google_vids": FEATURE_GOOGLE_VIDS,
         "youtube_upload": FEATURE_YOUTUBE_UPLOAD,
         "autopilot": FEATURE_AUTOPILOT,
         "credit_check": FEATURE_CREDIT_CHECK,
@@ -200,8 +208,8 @@ def feature_flags() -> dict[str, bool]:
 def pipeline_steps() -> list[str]:
     """Ordered job steps for the currently enabled feature set."""
     steps = ["story", "voiceover"]
-    if FEATURE_VEO or FEATURE_GROK_IMAGINE:
-        steps.append("generate")
+    if FEATURE_VEO or FEATURE_GROK_IMAGINE or FEATURE_GOOGLE_VIDS:
+        steps.append("visuals")
     steps.append("edit")
     if FEATURE_YOUTUBE_UPLOAD:
         steps.append("upload")

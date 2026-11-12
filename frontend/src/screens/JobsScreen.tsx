@@ -62,6 +62,7 @@ function statusMeta(s: string): { dot: string; badge: string; label: string } {
 const STEP_ICONS: Record<string, React.ComponentType<{ className?: string }>> = {
   story: BookOpen,
   voiceover: Mic,
+  visuals: Film,
   generate: Film,
   edit: Scissors,
   upload: Upload,

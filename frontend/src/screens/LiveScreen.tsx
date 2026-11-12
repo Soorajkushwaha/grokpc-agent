@@ -3,10 +3,11 @@ import { useApp } from '../context/AppContext';
 import { Send, ChevronDown, Monitor, KeyRound, ScrollText, WifiOff } from 'lucide-react';
 
 const LOGIN_SITES = [
-  { name: 'ChatGPT', url: 'chatgpt.com', why: 'Story / prompt plan (Phase 1)' },
+  { name: 'ChatGPT', url: 'chatgpt.com', why: 'Story / prompt plan' },
+  { name: 'Grok Imagine', url: 'grok.com/imagine', why: 'Scene clips — ek baar login karo' },
+  { name: 'Google Vids', url: 'vids.google.com', why: 'Scene clips — Google login' },
   { name: 'Google AI Studio', url: 'aistudio.google.com', why: 'Pro voiceover — Phase 2 flag' },
   { name: 'Gemini / Flow', url: 'gemini.google.com', why: 'Veo video gen — Phase 2' },
-  { name: 'Grok Imagine', url: 'grok.com', why: 'Image/video gen — Phase 2' },
   { name: 'YouTube Studio', url: 'studio.youtube.com', why: 'Upload — Phase 2' },
 ];
 

@@ -1,7 +1,9 @@
 """Phase 1 video pipeline orchestrator.
 
-Order (Phase 1): story+prompts -> voiceover -> FFmpeg edit (CapCut prepared if helper is up).
-Optional Phase 2 steps (generate, upload) are inserted only when their flags are on.
+Order: story+prompts -> voiceover -> visuals (Grok Imagine / Google Vids) -> FFmpeg edit
+(CapCut prepared if helper is up). Visuals fall back to the existing title-card path
+when not logged in, out of credits, or generation fails. Optional Phase 2 steps
+(upload) are inserted only when their flags are on.
 
 The currently working /api/task vision agent is independent: this runner uses
 the same BrowserAgentCore lock when it needs the browser (ChatGPT planning),
@@ -17,6 +19,7 @@ from typing import Any, Awaitable, Callable, Optional
 from config import (
     DRY_RUN,
     FEATURE_AUTOPILOT,
+    FEATURE_GOOGLE_VIDS,
     FEATURE_GROK_IMAGINE,
     FEATURE_VEO,
     FEATURE_YOUTUBE_UPLOAD,
@@ -189,35 +192,49 @@ class PipelineRunner:
                 set_step(job_id, "voiceover", "success", f"engine={engine}")
                 await self._emit(job_id, "Voiceover", f"{engine} -> {dest.name}", step="voiceover")
 
-            elif name == "generate":
-                if not (FEATURE_VEO or FEATURE_GROK_IMAGINE):
-                    set_step(job_id, "generate", "skipped", "Phase 2 flag off")
+            elif name in {"visuals", "generate"}:
+                # "visuals" is the current step name; "generate" is kept for older jobs.
+                if not (FEATURE_VEO or FEATURE_GROK_IMAGINE or FEATURE_GOOGLE_VIDS):
+                    set_step(job_id, name, "skipped", "visuals flags off")
                     continue
                 from generators import generate_media
 
-                dest = output_dir() / job_id
-                gen = await generate_media(
-                    plan or {},
-                    job_id=job_id,
-                    dest_dir=dest,
-                    agent=self.agent,
-                    log=self.broadcast,
-                )
-                if gen.get("status") == "waiting_credits":
-                    set_step(job_id, "generate", "failed", "waiting for credits")
-                    update_job(job_id, status="waiting_credits", credit_json=gen.get("credit") or gen)
-                    await self._emit(job_id, "Credits", "Koi provider ke tokens nahi mile — job ruk gayi", step="generate")
-                    return get_job(job_id)  # type: ignore
-                paths = [Path(p) for p in (gen.get("paths") or [])]
+                dest = output_dir() / job_id / "clips"
+                try:
+                    gen = await generate_media(
+                        plan or {},
+                        job_id=job_id,
+                        dest_dir=dest,
+                        agent=self.agent,
+                        log=self.broadcast,
+                    )
+                except Exception as exc:
+                    logger.exception("visuals step failed")
+                    set_step(job_id, name, "skipped", f"error, falling back: {exc}"[:500])
+                    await self._emit(job_id, "Visuals", f"fail, basic visuals use honge: {exc}", step=name)
+                    continue
+                paths = [Path(p) for p in (gen.get("paths") or []) if p]
                 media_paths.extend(paths)
-                update_job(job_id, media_json=[str(p) for p in media_paths], provider=gen.get("provider") or "")
-                if gen.get("status") == "skipped":
-                    set_step(job_id, "generate", "skipped", gen.get("note") or "")
-                elif gen.get("status") in {"ok", "success"} and paths:
-                    set_step(job_id, "generate", "success", f"{len(paths)} files")
+                update_job(
+                    job_id,
+                    media_json=[str(p) for p in media_paths],
+                    provider=gen.get("provider") or "",
+                    credit_json=gen.get("credit") or gen.get("auth") or {},
+                )
+                note = (gen.get("note") or "").strip()
+                # Never pause the job for credits / login — always fall through to edit.
+                if gen.get("status") in {"ok", "success"} and paths:
+                    detail = f"{len(paths)} clips"
+                    if gen.get("provider"):
+                        detail += f" via {gen['provider']}"
+                    if note:
+                        detail += f" — {note}"
+                    set_step(job_id, name, "success", detail[:500])
+                    await self._emit(job_id, "Visuals", detail, step=name)
                 else:
-                    # Don't fail the whole job — FFmpeg can still build a title-card video.
-                    set_step(job_id, "generate", "skipped", gen.get("note") or gen.get("status") or "no media")
+                    detail = note or gen.get("status") or "no clips; falling back to basic visuals"
+                    set_step(job_id, name, "skipped", detail[:500])
+                    await self._emit(job_id, "Visuals", detail, step=name)
 
             elif name == "edit":
                 title = (plan or {}).get("title") or job["topic"]

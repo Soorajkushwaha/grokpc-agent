@@ -29,6 +29,7 @@ os.environ.update(
         "WINDOWS_HELPER_URL": "http://127.0.0.1:1",  # nothing listening; fallback must work
         "FEATURE_VEO": "0",
         "FEATURE_GROK_IMAGINE": "0",
+        "FEATURE_GOOGLE_VIDS": "0",
         "FEATURE_YOUTUBE_UPLOAD": "0",
         "FEATURE_AUTOPILOT": "0",
         "FEATURE_CREDIT_CHECK": "0",
@@ -312,6 +313,158 @@ def test_auth_on_new_routes(client: TestClient) -> None:
         check(f"{path} 401", r.status_code == 401, str(r.status_code))
 
 
+
+def test_visuals_classify() -> None:
+    print("== visuals page classifier ==")
+    from generators import classify_page, scene_specs
+
+    grok_login = classify_page(
+        "https://accounts.x.com/i/flow/login",
+        "Log in to X",
+        "Sign in to continue to Grok. Sign in with X.",
+        password_count=1,
+    )
+    check("grok login is AUTH_REQUIRED", grok_login["auth_required"] is True, str(grok_login))
+
+    google_login = classify_page(
+        "https://accounts.google.com/v3/signin/identifier?continue=https://vids.google.com",
+        "Sign in - Google Accounts",
+        "Sign in with Google. Email or phone.",
+        password_count=0,
+    )
+    check("google login is AUTH_REQUIRED", google_login["auth_required"] is True, str(google_login))
+
+    paywall = classify_page(
+        "https://grok.com/imagine",
+        "Imagine",
+        "Upgrade to Premium to generate videos. Buy credits. Choose a plan.",
+        password_count=0,
+    )
+    check("paywall is no_credits", paywall["no_credits"] is True and not paywall["auth_required"], str(paywall))
+
+    zero = classify_page(
+        "https://vids.google.com",
+        "Vids",
+        "You have 0 credits remaining this month.",
+        password_count=0,
+    )
+    check("zero credits parsed", zero["credits_remaining"] == 0 and zero["no_credits"] is True, str(zero))
+
+    ok = classify_page(
+        "https://grok.com/imagine",
+        "Imagine",
+        "12 credits left. Describe a scene. Generate.",
+        password_count=0,
+    )
+    check("logged-in with credits", ok["auth_required"] is False and ok["no_credits"] is False and ok["credits_remaining"] == 12, str(ok))
+
+    plan = {
+        "title": "Test",
+        "scenes": [
+            {"video_prompt": "slow pan of a haveli", "duration_sec": 5},
+            {"image_prompt": "moonlit courtyard", "duration_sec": 4},
+            {"narration": "twist", "duration_sec": 3},
+        ],
+    }
+    specs = scene_specs(plan, limit=2)
+    check("scene_specs respects limit", len(specs) == 2 and "haveli" in specs[0]["prompt"], str(specs))
+
+
+def test_dry_run_visuals(client: TestClient, channel_id: str) -> None:
+    print("== DRY_RUN visuals step with fake clips ==")
+    from unittest.mock import patch
+
+    import generators as genmod
+    import pipeline as pipemod
+    from video_pipeline import assemble_clips, media_duration, write_silent_audio
+
+    # Direct DRY_RUN clip generation (flags patched on the module that reads them).
+    plan = {
+        "title": "Haveli ka raaz",
+        "voiceover_script": "Ek purani haveli mein raat ko ghungroo bajte hain.",
+        "scenes": [
+            {"video_prompt": "abandoned mansion night, slow dolly", "duration_sec": 3},
+            {"video_prompt": "ghungroo on a dark corridor floor", "duration_sec": 3},
+            {"video_prompt": "a door creaks open, twist reveal", "duration_sec": 3},
+        ],
+    }
+    dest = TMP / "visuals-unit" / "clips"
+    dest.mkdir(parents=True, exist_ok=True)
+
+    async def _fake():
+        with (
+            patch.object(genmod, "DRY_RUN", True),
+            patch.object(genmod, "FEATURE_GROK_IMAGINE", True),
+            patch.object(genmod, "FEATURE_GOOGLE_VIDS", True),
+        ):
+            return await genmod.generate_media(plan, job_id="unit-vis", dest_dir=dest)
+
+    result = asyncio.run(_fake())
+    check("dry_run visuals status ok", result.get("status") in {"ok", "success"}, str(result))
+    paths = [Path(p) for p in (result.get("paths") or [])]
+    check("dry_run made 3 fake clips", len(paths) == 3 and all(p.is_file() and p.stat().st_size > 500 for p in paths), str(paths))
+    check("provider dry_run", result.get("provider") == "dry_run", str(result.get("provider")))
+
+    audio = TMP / "visuals-unit" / "voice.mp3"
+    asyncio.run(write_silent_audio(audio, seconds=8.0))
+    out = TMP / "visuals-unit" / "final.mp4"
+
+    async def _stitch():
+        return await assemble_clips(
+            paths,
+            audio_path=audio,
+            dest=out,
+            size="1280x720",
+            duration_seconds=8,
+        )
+
+    edited = asyncio.run(_stitch())
+    check("assemble_clips success", edited.get("status") == "success" and Path(edited["video_path"]).is_file(), str(edited))
+    check("stitched file is non-trivial", Path(edited["video_path"]).stat().st_size > 1000, str(Path(edited["video_path"]).stat().st_size if Path(edited["video_path"]).is_file() else 0))
+
+    async def _dur():
+        return await media_duration(Path(edited["video_path"]))
+
+    dur = asyncio.run(_dur())
+    check("stitched duration near voiceover (~8s)", 6.5 <= dur <= 10.5, str(dur))
+
+    # End-to-end job with an explicit visuals step, flags patched on the running modules.
+    with (
+        patch.object(pipemod, "FEATURE_GROK_IMAGINE", True),
+        patch.object(pipemod, "FEATURE_GOOGLE_VIDS", True),
+        patch.object(genmod, "FEATURE_GROK_IMAGINE", True),
+        patch.object(genmod, "FEATURE_GOOGLE_VIDS", True),
+        patch.object(genmod, "DRY_RUN", True),
+    ):
+        job = jobs_mod.create_job(
+            channel_id=channel_id,
+            topic="Visuals dry-run pipeline",
+            idea="test",
+            steps=["story", "voiceover", "visuals", "edit"],
+        )
+        job_id = job["id"]
+        check("job has visuals step", [s["name"] for s in job["steps"]] == ["story", "voiceover", "visuals", "edit"], str(job["steps"]))
+
+        deadline = time.time() + 60
+        final = None
+        while time.time() < deadline:
+            r = client.get(f"/api/jobs/{job_id}", headers=AUTH)
+            final = r.json().get("job")
+            if final and final.get("status") in {"completed", "failed", "cancelled"}:
+                break
+            time.sleep(0.4)
+        check("visuals job completed", bool(final) and final.get("status") == "completed", str((final or {}).get("status")) + " " + str((final or {}).get("error")))
+        if not final:
+            return
+        steps = {s["name"]: s for s in final.get("steps") or []}
+        check("visuals step success", steps.get("visuals", {}).get("status") == "success", str(steps.get("visuals")))
+        media = [Path(p) for p in (final.get("media") or [])]
+        check("job media has clips", len(media) >= 1 and all(m.is_file() for m in media), str(final.get("media")))
+        final_path = Path(final.get("final_path") or "")
+        check("visuals final mp4 exists", final_path.is_file() and final_path.stat().st_size > 500, str(final_path))
+        check("edit still success", steps.get("edit", {}).get("status") == "success", str(steps.get("edit")))
+
+
 def main() -> int:
     print(f"temp dir: {TMP}")
     dbmod.init_db()
@@ -326,6 +479,8 @@ def main() -> int:
         test_scheduler_unit()
         test_path_helpers()
         test_dry_run_pipeline(client, channel_id)
+        test_visuals_classify()
+        test_dry_run_visuals(client, channel_id)
         test_pause_resume_cancel(client, channel_id)
     print(f"\n{'ALL PASSED' if failed == 0 else f'{failed} FAILED'}")
     return 1 if failed else 0

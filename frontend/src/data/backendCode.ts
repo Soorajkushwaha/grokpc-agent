@@ -1075,7 +1075,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from typing import Any, Awaitable, Callable, Optional
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 
 from playwright.async_api import BrowserContext, Page, async_playwright
 
@@ -1191,6 +1192,34 @@ class BrowserAgentCore:
             await self.playwright.stop()
             self.playwright = None
         self._external_browser = False
+
+    @asynccontextmanager
+    async def exclusive_page(self) -> AsyncIterator[Page]:
+        """Yield a fresh tab on the existing persistent profile.
+
+        Holds the agent lock so the vision loop and the visuals step never
+        launch a second persistent context (Chromium would refuse the profile).
+        """
+        async with self._lock:
+            self.is_busy = True
+            page: Optional[Page] = None
+            try:
+                await self.initialize_browser()
+                if self.context is None:
+                    raise RuntimeError("browser context was not created")
+                page = await self.context.new_page()
+                try:
+                    await page.set_viewport_size({"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT})
+                except Exception:
+                    pass
+                yield page
+            finally:
+                if page is not None:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+                self.is_busy = False
 
     async def run_generic_task(self, task: str, mock: Optional[MockLLM] = None) -> dict[str, Any]:
         async with self._lock:
@@ -1414,14 +1443,15 @@ async def decide(prompt: str, screenshot_png: bytes, mock: Optional[MockLLM] = N
         return await mock.decide(prompt, screenshot_png)
     if DRY_RUN:
         return await MockLLM().decide(prompt, screenshot_png)
-    if DEEPSEEK_API_KEY:
-        try:
-            return await decide_deepseek(prompt, screenshot_png, mime=mime)
-        except Exception as exc:
-            logger.warning("DeepSeek vision failed, falling back to Gemini: %s", exc)
+    # Prefer free Gemini when a key is present; DeepSeek is the paid fallback.
     if GEMINI_API_KEY:
-        return await decide_gemini(prompt, screenshot_png, mime=mime)
-    raise RuntimeError("No vision LLM configured (set DEEPSEEK_API_KEY or GEMINI_API_KEY, or DRY_RUN=1)")
+        try:
+            return await decide_gemini(prompt, screenshot_png, mime=mime)
+        except Exception as exc:
+            logger.warning("Gemini vision failed, falling back to DeepSeek: %s", exc)
+    if DEEPSEEK_API_KEY:
+        return await decide_deepseek(prompt, screenshot_png, mime=mime)
+    raise RuntimeError("No vision LLM configured (set GEMINI_API_KEY or DEEPSEEK_API_KEY, or DRY_RUN=1)")
 
 
 _KEY_ALIASES = {
@@ -1773,6 +1803,158 @@ def _escape_drawtext(text: str) -> str:
     return cleaned
 
 
+
+
+async def media_duration(path: Optional[Path]) -> float:
+    """Return duration in seconds via ffprobe, or 0 if unknown."""
+    import shutil
+
+    if not path or not Path(path).is_file():
+        return 0.0
+    if not shutil.which("ffprobe"):
+        return 0.0
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "csv=p=0",
+        str(path),
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    out, _err = await proc.communicate()
+    try:
+        return max(0.0, float((out or b"").decode("utf-8", "replace").strip() or 0))
+    except ValueError:
+        return 0.0
+
+
+async def _normalize_clip(
+    src: Path,
+    dest: Path,
+    size: str,
+    target_dur: Optional[float] = None,
+) -> bool:
+    """Scale/pad a clip to \`size\`, drop audio, optionally loop/trim to target_dur."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    w, h = size.split("x")
+    vf = (
+        f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+        f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,fps=30,setsar=1,format=yuv420p"
+    )
+    src_dur = await media_duration(src)
+    inputs: list[str] = ["-i", str(src)]
+    if target_dur and src_dur and src_dur < (target_dur - 0.15):
+        inputs = ["-stream_loop", "-1", "-i", str(src)]
+    cmd = [
+        "ffmpeg", "-y",
+        *inputs,
+        "-vf", vf,
+        "-an",
+        "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+    ]
+    if target_dur and target_dur > 0:
+        cmd += ["-t", f"{target_dur:.3f}"]
+    cmd.append(str(dest))
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    _o, err = await proc.communicate()
+    if proc.returncode != 0 or not dest.is_file() or dest.stat().st_size < 500:
+        logger.info("normalize %s failed: %s", src.name, (err or b"").decode("utf-8", "replace")[-300:])
+        return False
+    return True
+
+
+async def assemble_clips(
+    clips: list[Path],
+    *,
+    audio_path: Optional[Path],
+    dest: Path,
+    size: str,
+    duration_seconds: int,
+    log: Optional[LogFn] = None,
+) -> dict[str, Any]:
+    """Concat/scale clips, loop or trim to the voiceover, overlay the voiceover.
+
+    Each clip is re-encoded to the channel aspect so mixed resolutions/codecs
+    still concat cleanly. If the joined picture is shorter than the voiceover
+    it is looped; if longer, it is trimmed. On any failure the caller falls
+    back to the image/title-card path.
+    """
+    import shutil
+
+    clips = [Path(c) for c in clips if Path(c).is_file()]
+    if not clips:
+        raise RuntimeError("no clips to assemble")
+
+    work = dest.parent / f".work_{dest.stem}"
+    work.mkdir(parents=True, exist_ok=True)
+    try:
+        audio_dur = await media_duration(audio_path) if audio_path else 0.0
+        target = audio_dur if audio_dur >= 1 else float(max(int(duration_seconds), 8))
+
+        # Give each clip an even slice of the voiceover (loop or trim).
+        per = target / max(len(clips), 1)
+        norms: list[Path] = []
+        for i, src in enumerate(clips):
+            n = work / f"n{i:02d}.mp4"
+            ok = await _normalize_clip(src, n, size, target_dur=per)
+            if ok:
+                norms.append(n)
+        if not norms:
+            raise RuntimeError("could not normalize any clip")
+
+        lst = work / "concat.txt"
+        lst.write_text("".join(f"file '{n.resolve()}'\\n" for n in norms), encoding="utf-8")
+        joined = work / "joined.mp4"
+        cmd = [
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(lst),
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-an",
+            "-movflags", "+faststart",
+            str(joined),
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        _o, err = await proc.communicate()
+        if proc.returncode != 0 or not joined.is_file():
+            raise RuntimeError((err or b"").decode("utf-8", "replace")[-800:] or "concat failed")
+
+        joined_dur = await media_duration(joined) or per * len(norms)
+        audio_args: list[str] = []
+        map_args = ["-map", "0:v"]
+        if audio_path and Path(audio_path).is_file():
+            audio_args = ["-i", str(audio_path)]
+            map_args += ["-map", "1:a", "-c:a", "aac", "-b:a", "128k"]
+        loop_args: list[str] = []
+        if joined_dur < target - 0.2:
+            loop_args = ["-stream_loop", "-1"]
+
+        cmd = [
+            "ffmpeg", "-y",
+            *loop_args, "-i", str(joined),
+            *audio_args,
+            *map_args,
+            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-t", f"{target:.3f}",
+            "-movflags", "+faststart",
+            str(dest),
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        _o, err = await proc.communicate()
+        if proc.returncode != 0 or not dest.is_file() or dest.stat().st_size < 500:
+            raise RuntimeError((err or b"").decode("utf-8", "replace")[-800:] or "mux failed")
+
+        await _emit(log, "system", "Video ready", f"Saved to {dest}")
+        record_usage(task_type="video", status="ok", details=str(dest), provider="ffmpeg", model="clips")
+        return {"status": "success", "video_path": str(dest), "engine": "ffmpeg-clips"}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 async def assemble_video(
     *,
     title: str,
@@ -1828,21 +2010,18 @@ async def assemble_video(
     images = [Path(i) for i in (images or []) if Path(i).is_file()]
 
     if clips:
-        lst = out.with_suffix(".concat.txt")
-        lst.write_text("".join(f"file '{c}'\\n" for c in clips), encoding="utf-8")
-        cmd = [
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(lst),
-            *audio_args,
-            "-c:v", "libx264", "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "128k",
-            "-shortest", "-movflags", "+faststart",
-            str(out),
-        ]
-        code, err = await _run(cmd)
-        if code == 0 and out.is_file():
-            await _emit(log, "system", "Video ready", f"Saved to {out}")
-            record_usage(task_type="video", status="ok", details=str(out), provider="ffmpeg", model="concat")
-            return {"status": "success", "video_path": str(out), "engine": "ffmpeg-concat"}
+        try:
+            return await assemble_clips(
+                clips,
+                audio_path=Path(audio_path) if audio_path else None,
+                dest=out,
+                size=size,
+                duration_seconds=duration,
+                log=log,
+            )
+        except Exception as exc:
+            logger.warning("clip assembly failed, falling back: %s", exc)
+            await _emit(log, "system", "FFmpeg clips", f"clip stitch fail ({exc}); fallback")
 
     if images:
         # One image held for \`duration / n\` each, scaled to size.
@@ -1906,8 +2085,10 @@ async def assemble_video(
     category: "python",
     content: `"""Phase 1 video pipeline orchestrator.
 
-Order (Phase 1): story+prompts -> voiceover -> FFmpeg edit (CapCut prepared if helper is up).
-Optional Phase 2 steps (generate, upload) are inserted only when their flags are on.
+Order: story+prompts -> voiceover -> visuals (Grok Imagine / Google Vids) -> FFmpeg edit
+(CapCut prepared if helper is up). Visuals fall back to the existing title-card path
+when not logged in, out of credits, or generation fails. Optional Phase 2 steps
+(upload) are inserted only when their flags are on.
 
 The currently working /api/task vision agent is independent: this runner uses
 the same BrowserAgentCore lock when it needs the browser (ChatGPT planning),
@@ -1923,6 +2104,7 @@ from typing import Any, Awaitable, Callable, Optional
 from config import (
     DRY_RUN,
     FEATURE_AUTOPILOT,
+    FEATURE_GOOGLE_VIDS,
     FEATURE_GROK_IMAGINE,
     FEATURE_VEO,
     FEATURE_YOUTUBE_UPLOAD,
@@ -2095,35 +2277,49 @@ class PipelineRunner:
                 set_step(job_id, "voiceover", "success", f"engine={engine}")
                 await self._emit(job_id, "Voiceover", f"{engine} -> {dest.name}", step="voiceover")
 
-            elif name == "generate":
-                if not (FEATURE_VEO or FEATURE_GROK_IMAGINE):
-                    set_step(job_id, "generate", "skipped", "Phase 2 flag off")
+            elif name in {"visuals", "generate"}:
+                # "visuals" is the current step name; "generate" is kept for older jobs.
+                if not (FEATURE_VEO or FEATURE_GROK_IMAGINE or FEATURE_GOOGLE_VIDS):
+                    set_step(job_id, name, "skipped", "visuals flags off")
                     continue
                 from generators import generate_media
 
-                dest = output_dir() / job_id
-                gen = await generate_media(
-                    plan or {},
-                    job_id=job_id,
-                    dest_dir=dest,
-                    agent=self.agent,
-                    log=self.broadcast,
-                )
-                if gen.get("status") == "waiting_credits":
-                    set_step(job_id, "generate", "failed", "waiting for credits")
-                    update_job(job_id, status="waiting_credits", credit_json=gen.get("credit") or gen)
-                    await self._emit(job_id, "Credits", "Koi provider ke tokens nahi mile — job ruk gayi", step="generate")
-                    return get_job(job_id)  # type: ignore
-                paths = [Path(p) for p in (gen.get("paths") or [])]
+                dest = output_dir() / job_id / "clips"
+                try:
+                    gen = await generate_media(
+                        plan or {},
+                        job_id=job_id,
+                        dest_dir=dest,
+                        agent=self.agent,
+                        log=self.broadcast,
+                    )
+                except Exception as exc:
+                    logger.exception("visuals step failed")
+                    set_step(job_id, name, "skipped", f"error, falling back: {exc}"[:500])
+                    await self._emit(job_id, "Visuals", f"fail, basic visuals use honge: {exc}", step=name)
+                    continue
+                paths = [Path(p) for p in (gen.get("paths") or []) if p]
                 media_paths.extend(paths)
-                update_job(job_id, media_json=[str(p) for p in media_paths], provider=gen.get("provider") or "")
-                if gen.get("status") == "skipped":
-                    set_step(job_id, "generate", "skipped", gen.get("note") or "")
-                elif gen.get("status") in {"ok", "success"} and paths:
-                    set_step(job_id, "generate", "success", f"{len(paths)} files")
+                update_job(
+                    job_id,
+                    media_json=[str(p) for p in media_paths],
+                    provider=gen.get("provider") or "",
+                    credit_json=gen.get("credit") or gen.get("auth") or {},
+                )
+                note = (gen.get("note") or "").strip()
+                # Never pause the job for credits / login — always fall through to edit.
+                if gen.get("status") in {"ok", "success"} and paths:
+                    detail = f"{len(paths)} clips"
+                    if gen.get("provider"):
+                        detail += f" via {gen['provider']}"
+                    if note:
+                        detail += f" — {note}"
+                    set_step(job_id, name, "success", detail[:500])
+                    await self._emit(job_id, "Visuals", detail, step=name)
                 else:
-                    # Don't fail the whole job — FFmpeg can still build a title-card video.
-                    set_step(job_id, "generate", "skipped", gen.get("note") or gen.get("status") or "no media")
+                    detail = note or gen.get("status") or "no clips; falling back to basic visuals"
+                    set_step(job_id, name, "skipped", detail[:500])
+                    await self._emit(job_id, "Visuals", detail, step=name)
 
             elif name == "edit":
                 title = (plan or {}).get("title") or job["topic"]
@@ -2243,7 +2439,9 @@ DB_PATH=/app/data/agent_tasks.db
 # Optional paid voice. Default is free gTTS (silent ffmpeg in DRY_RUN).
 USE_GEMINI_TTS=0
 GEMINI_TTS_MODEL=gemini-3.8-flash-lite-tts
-GEMINI_VISION_MODEL=gemini-2.5-flash
+GEMINI_VISION_MODEL=gemini-3.8-flash
+# Free-tier Gemini text planner (default). Leave GEMINI_API_KEY empty until you add a key.
+GEMINI_TEXT_MODEL=gemini-3.8-flash
 DEEPSEEK_MODEL=deepseek-flash
 
 # Used only to display INR estimates from official USD token prices.
@@ -2291,9 +2489,15 @@ DAILY_VIDEO_CAP=3
 DAILY_SPEND_CAP_INR=40
 AUTOPILOT_ENABLED=0
 
-# --- Phase 2 (default OFF — do not turn on until tested on the laptop) ---
+# --- Visuals step (default ON; falls back to a title-card if not logged in) ---
+FEATURE_GROK_IMAGINE=1
+FEATURE_GOOGLE_VIDS=1
+# Max AI clips per job, and how long to wait for one clip (seconds). Never buys credits.
+MAX_CLIPS_PER_JOB=4
+CLIP_TIMEOUT_SEC=240
+
+# --- Still Phase 2 (default OFF — do not turn on until tested on the laptop) ---
 FEATURE_VEO=0
-FEATURE_GROK_IMAGINE=0
 FEATURE_YOUTUBE_UPLOAD=0
 FEATURE_AUTOPILOT=0
 FEATURE_CREDIT_CHECK=0
