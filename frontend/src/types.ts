@@ -1,6 +1,23 @@
 export type TabType = 'live-pc' | 'automation' | 'budget' | 'oracle-code';
 
+export type BackendId = 'laptop' | 'tablet' | 'vps';
+
+export const BACKEND_OPTIONS: { id: BackendId; label: string; hint: string }[] = [
+  { id: 'laptop', label: 'Laptop', hint: 'Windows WSL' },
+  { id: 'tablet', label: 'Tablet', hint: 'Termux / Pad' },
+  { id: 'vps', label: 'VPS', hint: 'Cloud Ubuntu' },
+];
+
+export interface BackendSlot {
+  backendUrl: string;
+  agentToken: string;
+  vncUrl: string;
+}
+
 export interface ConnectionConfig {
+  activeBackend: BackendId;
+  backends: Record<BackendId, BackendSlot>;
+  /** Mirrors of the active slot — existing screens use these. */
   backendUrl: string;
   agentToken: string;
   /** Optional dedicated noVNC tunnel. If empty, the app uses backendUrl/novnc/. */

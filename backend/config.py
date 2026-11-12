@@ -89,6 +89,26 @@ VIEWPORT_HEIGHT = int(os.getenv("VIEWPORT_HEIGHT", "720" if LOW_MEMORY else "900
 
 NOVNC_UPSTREAM = os.getenv("NOVNC_UPSTREAM", "http://127.0.0.1:6080")
 
+# Android / Termux: drive a system Chromium (Playwright has no official Android browsers).
+def _is_termux() -> bool:
+    return bool(os.getenv("TERMUX_VERSION") or os.getenv("PREFIX", "").endswith("/com.termux/files/usr") or Path("/data/data/com.termux/files").exists())
+
+ANDROID = _bool("ANDROID", _is_termux())
+if ANDROID and os.getenv("LOW_MEMORY") is None:
+    LOW_MEMORY = True
+    if os.getenv("VIEWPORT_WIDTH") is None:
+        VIEWPORT_WIDTH = 1280
+    if os.getenv("VIEWPORT_HEIGHT") is None:
+        VIEWPORT_HEIGHT = 720
+
+CDP_URL = os.getenv("CDP_URL", "").strip()
+CHROMIUM_PATH = os.getenv("CHROMIUM_PATH", "").strip()
+# Data-saving screenshots (JPEG) — default on Termux / low-memory boxes.
+SCREENSHOT_FORMAT = os.getenv("SCREENSHOT_FORMAT", "jpeg" if ANDROID or LOW_MEMORY else "png").strip().lower()
+SCREENSHOT_QUALITY = int(os.getenv("SCREENSHOT_QUALITY", "45"))
+# Push step screenshots to the phone UI over the websocket. Off on Termux to save 5G.
+SCREENSHOT_TO_UI = _bool("SCREENSHOT_TO_UI", not ANDROID)
+
 
 def output_dir() -> Path:
     if OUTPUT_DIR:

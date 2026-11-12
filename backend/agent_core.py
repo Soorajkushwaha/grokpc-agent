@@ -8,7 +8,10 @@ from typing import Any, Awaitable, Callable, Optional
 
 from playwright.async_api import BrowserContext, Page, async_playwright
 
-from config import CHROME_PROFILE_DIR, DRY_RUN, HEADLESS, LOW_MEMORY, VIEWPORT_HEIGHT, VIEWPORT_WIDTH
+from config import (
+    ANDROID, CDP_URL, CHROME_PROFILE_DIR, CHROMIUM_PATH, DRY_RUN, HEADLESS,
+    LOW_MEMORY, VIEWPORT_HEIGHT, VIEWPORT_WIDTH,
+)
 from vision_loop import MockLLM, run_vision_task
 
 logger = logging.getLogger("grokpc.agent")
@@ -24,6 +27,7 @@ class BrowserAgentCore:
         self.page: Optional[Page] = None
         self.is_busy = False
         self._lock = asyncio.Lock()
+        self._external_browser = False  # CDP-attached; do not kill Chromium on close
 
     async def emit(self, typ: str, title: str, message: str, **extra: Any) -> None:
         payload = {"type": typ, "title": title, "message": message, **extra}
@@ -38,8 +42,6 @@ class BrowserAgentCore:
         await self.emit("system", "Launching browser", f"Profile {CHROME_PROFILE_DIR}")
         self.playwright = await async_playwright().start()
         launch_headless = HEADLESS if headless is None else headless
-        # Use the bundled Chromium (playwright install chromium). Do not set channel=
-        # and do not spoof an x86_64 UA on Ampere ARM64.
         chrome_args = [
             "--no-sandbox",
             "--disable-setuid-sandbox",
@@ -54,7 +56,7 @@ class BrowserAgentCore:
             "--mute-audio",
             "--no-first-run",
         ]
-        if LOW_MEMORY:
+        if LOW_MEMORY or ANDROID:
             chrome_args += [
                 "--js-flags=--max-old-space-size=384",
                 "--renderer-process-limit=2",
@@ -62,25 +64,62 @@ class BrowserAgentCore:
                 "--disk-cache-size=67108864",
                 "--force-device-scale-factor=1",
             ]
-        self.context = await self.playwright.chromium.launch_persistent_context(
+
+        if CDP_URL:
+            # Preferred on Termux: attach to a system Chromium we already started.
+            last_err: Exception | None = None
+            for attempt in range(1, 16):
+                try:
+                    browser = await self.playwright.chromium.connect_over_cdp(CDP_URL)
+                    self._external_browser = True
+                    self.context = browser.contexts[0] if browser.contexts else await browser.new_context(
+                        viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT}
+                    )
+                    pages = self.context.pages
+                    self.page = pages[0] if pages else await self.context.new_page()
+                    try:
+                        await self.page.set_viewport_size({"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT})
+                    except Exception:
+                        pass
+                    await self.emit("system", "Browser ready", f"cdp={CDP_URL} low_mem={LOW_MEMORY} {VIEWPORT_WIDTH}x{VIEWPORT_HEIGHT}")
+                    return self.context
+                except Exception as exc:
+                    last_err = exc
+                    await self.emit("system", "CDP wait", f"attempt {attempt}/15: {exc}")
+                    await asyncio.sleep(2)
+            raise RuntimeError(f"Could not connect to Chromium at {CDP_URL}: {last_err}")
+
+        # Bundled Chromium (VPS / WSL) or a system binary via CHROMIUM_PATH (Termux fallback).
+        if CHROMIUM_PATH:
+            os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "0")
+        launch_kwargs: dict[str, Any] = dict(
             user_data_dir=CHROME_PROFILE_DIR,
             headless=launch_headless,
             viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
             args=chrome_args,
         )
+        if CHROMIUM_PATH:
+            launch_kwargs["executable_path"] = CHROMIUM_PATH
+        self.context = await self.playwright.chromium.launch_persistent_context(**launch_kwargs)
         pages = self.context.pages
         self.page = pages[0] if pages else await self.context.new_page()
-        await self.emit("system", "Browser ready", f"headless={launch_headless} low_mem={LOW_MEMORY} {VIEWPORT_WIDTH}x{VIEWPORT_HEIGHT}")
+        how = f"executable_path={CHROMIUM_PATH}" if CHROMIUM_PATH else "bundled"
+        await self.emit("system", "Browser ready", f"{how} headless={launch_headless} low_mem={LOW_MEMORY} {VIEWPORT_WIDTH}x{VIEWPORT_HEIGHT}")
         return self.context
 
     async def close(self) -> None:
-        if self.context:
+        if self._external_browser:
+            # Leave the system Chromium (and its profile) running for noVNC / next task.
+            self.context = None
+            self.page = None
+        elif self.context:
             await self.context.close()
             self.context = None
             self.page = None
         if self.playwright:
             await self.playwright.stop()
             self.playwright = None
+        self._external_browser = False
 
     async def run_generic_task(self, task: str, mock: Optional[MockLLM] = None) -> dict[str, Any]:
         async with self._lock:

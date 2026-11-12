@@ -832,7 +832,10 @@ from typing import Any, Awaitable, Callable, Optional
 
 from playwright.async_api import BrowserContext, Page, async_playwright
 
-from config import CHROME_PROFILE_DIR, DRY_RUN, HEADLESS, LOW_MEMORY, VIEWPORT_HEIGHT, VIEWPORT_WIDTH
+from config import (
+    ANDROID, CDP_URL, CHROME_PROFILE_DIR, CHROMIUM_PATH, DRY_RUN, HEADLESS,
+    LOW_MEMORY, VIEWPORT_HEIGHT, VIEWPORT_WIDTH,
+)
 from vision_loop import MockLLM, run_vision_task
 
 logger = logging.getLogger("grokpc.agent")
@@ -848,6 +851,7 @@ class BrowserAgentCore:
         self.page: Optional[Page] = None
         self.is_busy = False
         self._lock = asyncio.Lock()
+        self._external_browser = False  # CDP-attached; do not kill Chromium on close
 
     async def emit(self, typ: str, title: str, message: str, **extra: Any) -> None:
         payload = {"type": typ, "title": title, "message": message, **extra}
@@ -862,8 +866,6 @@ class BrowserAgentCore:
         await self.emit("system", "Launching browser", f"Profile {CHROME_PROFILE_DIR}")
         self.playwright = await async_playwright().start()
         launch_headless = HEADLESS if headless is None else headless
-        # Use the bundled Chromium (playwright install chromium). Do not set channel=
-        # and do not spoof an x86_64 UA on Ampere ARM64.
         chrome_args = [
             "--no-sandbox",
             "--disable-setuid-sandbox",
@@ -878,7 +880,7 @@ class BrowserAgentCore:
             "--mute-audio",
             "--no-first-run",
         ]
-        if LOW_MEMORY:
+        if LOW_MEMORY or ANDROID:
             chrome_args += [
                 "--js-flags=--max-old-space-size=384",
                 "--renderer-process-limit=2",
@@ -886,25 +888,62 @@ class BrowserAgentCore:
                 "--disk-cache-size=67108864",
                 "--force-device-scale-factor=1",
             ]
-        self.context = await self.playwright.chromium.launch_persistent_context(
+
+        if CDP_URL:
+            # Preferred on Termux: attach to a system Chromium we already started.
+            last_err: Exception | None = None
+            for attempt in range(1, 16):
+                try:
+                    browser = await self.playwright.chromium.connect_over_cdp(CDP_URL)
+                    self._external_browser = True
+                    self.context = browser.contexts[0] if browser.contexts else await browser.new_context(
+                        viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT}
+                    )
+                    pages = self.context.pages
+                    self.page = pages[0] if pages else await self.context.new_page()
+                    try:
+                        await self.page.set_viewport_size({"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT})
+                    except Exception:
+                        pass
+                    await self.emit("system", "Browser ready", f"cdp={CDP_URL} low_mem={LOW_MEMORY} {VIEWPORT_WIDTH}x{VIEWPORT_HEIGHT}")
+                    return self.context
+                except Exception as exc:
+                    last_err = exc
+                    await self.emit("system", "CDP wait", f"attempt {attempt}/15: {exc}")
+                    await asyncio.sleep(2)
+            raise RuntimeError(f"Could not connect to Chromium at {CDP_URL}: {last_err}")
+
+        # Bundled Chromium (VPS / WSL) or a system binary via CHROMIUM_PATH (Termux fallback).
+        if CHROMIUM_PATH:
+            os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "0")
+        launch_kwargs: dict[str, Any] = dict(
             user_data_dir=CHROME_PROFILE_DIR,
             headless=launch_headless,
             viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
             args=chrome_args,
         )
+        if CHROMIUM_PATH:
+            launch_kwargs["executable_path"] = CHROMIUM_PATH
+        self.context = await self.playwright.chromium.launch_persistent_context(**launch_kwargs)
         pages = self.context.pages
         self.page = pages[0] if pages else await self.context.new_page()
-        await self.emit("system", "Browser ready", f"headless={launch_headless} low_mem={LOW_MEMORY} {VIEWPORT_WIDTH}x{VIEWPORT_HEIGHT}")
+        how = f"executable_path={CHROMIUM_PATH}" if CHROMIUM_PATH else "bundled"
+        await self.emit("system", "Browser ready", f"{how} headless={launch_headless} low_mem={LOW_MEMORY} {VIEWPORT_WIDTH}x{VIEWPORT_HEIGHT}")
         return self.context
 
     async def close(self) -> None:
-        if self.context:
+        if self._external_browser:
+            # Leave the system Chromium (and its profile) running for noVNC / next task.
+            self.context = None
+            self.page = None
+        elif self.context:
             await self.context.close()
             self.context = None
             self.page = None
         if self.playwright:
             await self.playwright.stop()
             self.playwright = None
+        self._external_browser = False
 
     async def run_generic_task(self, task: str, mock: Optional[MockLLM] = None) -> dict[str, Any]:
         async with self._lock:
@@ -1130,7 +1169,7 @@ class MockLLM:
         return action, {"provider": "mock", "model": "mock-llm", "tokens_in": 0, "tokens_out": 0}
 
 
-async def decide_deepseek(prompt: str, screenshot_png: bytes) -> tuple[dict[str, Any], dict[str, Any]]:
+async def decide_deepseek(prompt: str, screenshot_png: bytes, mime: str = "image/png") -> tuple[dict[str, Any], dict[str, Any]]:
     b64 = base64.b64encode(screenshot_png).decode("ascii")
     body = {
         "model": DEEPSEEK_MODEL,
@@ -1143,7 +1182,7 @@ async def decide_deepseek(prompt: str, screenshot_png: bytes) -> tuple[dict[str,
                     {"type": "text", "text": prompt},
                     {
                         "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{b64}"},
+                        "image_url": {"url": f"data:{mime};base64,{b64}"},
                     },
                 ],
             },
@@ -1181,7 +1220,7 @@ async def decide_deepseek(prompt: str, screenshot_png: bytes) -> tuple[dict[str,
     return action, meta
 
 
-async def decide_gemini(prompt: str, screenshot_png: bytes) -> tuple[dict[str, Any], dict[str, Any]]:
+async def decide_gemini(prompt: str, screenshot_png: bytes, mime: str = "image/png") -> tuple[dict[str, Any], dict[str, Any]]:
     from google import genai
     from google.genai import types
 
@@ -1189,7 +1228,7 @@ async def decide_gemini(prompt: str, screenshot_png: bytes) -> tuple[dict[str, A
     response = await client.aio.models.generate_content(
         model=GEMINI_VISION_MODEL,
         contents=[
-            types.Part.from_bytes(data=screenshot_png, mime_type="image/png"),
+            types.Part.from_bytes(data=screenshot_png, mime_type=mime),
             SYSTEM_PROMPT + "\\n\\nTask:\\n" + prompt,
         ],
     )
@@ -1216,18 +1255,18 @@ async def decide_gemini(prompt: str, screenshot_png: bytes) -> tuple[dict[str, A
     return action, meta
 
 
-async def decide(prompt: str, screenshot_png: bytes, mock: Optional[MockLLM] = None) -> tuple[dict[str, Any], dict[str, Any]]:
+async def decide(prompt: str, screenshot_png: bytes, mock: Optional[MockLLM] = None, mime: str = "image/png") -> tuple[dict[str, Any], dict[str, Any]]:
     if mock is not None:
         return await mock.decide(prompt, screenshot_png)
     if DRY_RUN:
         return await MockLLM().decide(prompt, screenshot_png)
     if DEEPSEEK_API_KEY:
         try:
-            return await decide_deepseek(prompt, screenshot_png)
+            return await decide_deepseek(prompt, screenshot_png, mime=mime)
         except Exception as exc:
             logger.warning("DeepSeek vision failed, falling back to Gemini: %s", exc)
     if GEMINI_API_KEY:
-        return await decide_gemini(prompt, screenshot_png)
+        return await decide_gemini(prompt, screenshot_png, mime=mime)
     raise RuntimeError("No vision LLM configured (set DEEPSEEK_API_KEY or GEMINI_API_KEY, or DRY_RUN=1)")
 
 
@@ -1264,6 +1303,16 @@ async def apply_action(page, action: dict[str, Any]) -> str:
     return f"Unknown action {kind}"
 
 
+
+async def _capture_screenshot(page) -> tuple[bytes, str]:
+    fmt = (SCREENSHOT_FORMAT or "png").lower()
+    if fmt in {"jpg", "jpeg"}:
+        data = await page.screenshot(type="jpeg", quality=max(1, min(SCREENSHOT_QUALITY, 100)), full_page=False)
+        return data, "image/jpeg"
+    data = await page.screenshot(type="png", full_page=False)
+    return data, "image/png"
+
+
 async def run_vision_task(
     page,
     task: str,
@@ -1278,26 +1327,27 @@ async def run_vision_task(
     history: list[dict[str, Any]] = []
     last_result = ""
     for step in range(1, steps + 1):
-        png = await page.screenshot(type="png", full_page=False)
+        image, mime = await _capture_screenshot(page)
         prompt = (
             f"Task: {task}\\n"
             f"Step {step}/{steps}. URL: {page.url}\\n"
             f"Last result: {last_result or 'none'}\\n"
             "Decide the next single action."
         )
-        action, meta = await decide(prompt, png, mock=mock)
+        action, meta = await decide(prompt, image, mock=mock, mime=mime)
         if log:
-            await log(
-                {
-                    "type": "vision",
-                    "title": f"Vision step {step}: {action.get('action')}",
-                    "message": action.get("thought") or "",
-                    "coords": {"x": action.get("x") or 0, "y": action.get("y") or 0},
-                    "costInr": None,
-                    "meta": meta,
-                    "screenshotPngB64": base64.b64encode(png).decode("ascii") if step <= 8 else None,
-                }
-            )
+            payload = {
+                "type": "vision",
+                "title": f"Vision step {step}: {action.get('action')}",
+                "message": action.get("thought") or "",
+                "coords": {"x": action.get("x") or 0, "y": action.get("y") or 0},
+                "costInr": None,
+                "meta": meta,
+            }
+            if SCREENSHOT_TO_UI and step <= 8:
+                payload["screenshotPngB64"] = base64.b64encode(image).decode("ascii")
+                payload["screenshotMime"] = mime
+            await log(payload)
         last_result = await apply_action(page, action)
         history.append({"step": step, "action": action, "result": last_result, "meta": meta})
         if (action.get("action") or "").lower() == "done":
@@ -1530,6 +1580,16 @@ NOVNC_UPSTREAM=http://127.0.0.1:6080
 LOW_MEMORY=
 VIEWPORT_WIDTH=
 VIEWPORT_HEIGHT=
+
+# Termux / Android tablet: set ANDROID=1, point at system Chromium, skip bundled browsers.
+# Playwright does not officially support Android; we connect over CDP (preferred) or executable_path.
+ANDROID=0
+CDP_URL=
+CHROMIUM_PATH=
+PLAYWRIGHT_BROWSERS_PATH=
+SCREENSHOT_FORMAT=
+SCREENSHOT_QUALITY=45
+SCREENSHOT_TO_UI=
 `,
   }
 ];

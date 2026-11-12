@@ -1,0 +1,12 @@
+# Termux (Android ARM64): do NOT pip-install playwright.
+# Use official Termux packages: `pkg install python-playwright playwright chromium`
+# (Python 3.14 has no official Playwright Android browsers anyway.)
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+httpx==0.28.1
+pydantic==2.10.6
+google-genai==2.4.0
+gTTS==2.5.4
+python-dotenv==1.0.1
+websockets==13.1
+websockify==0.13.0

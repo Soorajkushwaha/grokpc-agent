@@ -9,7 +9,7 @@ import {
   WhatsAppPayload,
   GoogleVidsConfig,
 } from '../types';
-import { apiFetch, isConfigured, loadConfig, novncIframeUrl, saveConfig, StoredConfig, wsUrl } from '../api';
+import { apiFetch, isConfigured, loadConfig, novncIframeUrl, saveConfig, StoredConfig, withActive, wsUrl } from '../api';
 
 interface SimulatedDesktopState {
   activeApp: 'chrome' | 'terminal' | 'vids' | 'files';
@@ -109,7 +109,10 @@ const EMPTY_BUDGET: BudgetMetrics = {
 const AppContext = createContext<AppContextType | null>(null);
 
 function toStored(c: ConnectionConfig): StoredConfig {
-  return { backendUrl: c.backendUrl, agentToken: c.agentToken, vncUrl: c.vncUrl, demoMode: c.demoMode };
+  const backends = c.backends || { laptop: { backendUrl: '', agentToken: '', vncUrl: '' }, tablet: { backendUrl: '', agentToken: '', vncUrl: '' }, vps: { backendUrl: '', agentToken: '', vncUrl: '' } };
+  const active = c.activeBackend || 'laptop';
+  backends[active] = { backendUrl: c.backendUrl, agentToken: c.agentToken, vncUrl: c.vncUrl };
+  return withActive({ activeBackend: active, backends, demoMode: c.demoMode });
 }
 
 export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
@@ -118,6 +121,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [config, setConfig] = useState<ConnectionConfig>(() => {
     const configured = isConfigured(stored);
     return {
+      activeBackend: stored.activeBackend,
+      backends: stored.backends,
       backendUrl: stored.backendUrl,
       agentToken: stored.agentToken,
       vncUrl: stored.vncUrl,
@@ -164,7 +169,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
   const ingestWsPayload = useCallback((data: Record<string, unknown>) => {
     if (data.screenshotPngB64 && typeof data.screenshotPngB64 === 'string') {
-      setLiveScreenshot(`data:image/png;base64,${data.screenshotPngB64}`);
+      const mime = (data as { screenshotMime?: string }).screenshotMime || 'image/png';
+      setLiveScreenshot(`data:${mime};base64,${data.screenshotPngB64}`);
     }
     if (data.pendingApproval && typeof data.pendingApproval === 'object') {
       const p = data.pendingApproval as PendingApproval;
@@ -199,8 +205,39 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
   const updateConfig = (updates: Partial<ConnectionConfig>) => {
     setConfig((prev) => {
-      const next = { ...prev, ...updates };
-      saveConfig(toStored(next));
+      const backends = {
+        laptop: { backendUrl: '', agentToken: '', vncUrl: '' },
+        tablet: { backendUrl: '', agentToken: '', vncUrl: '' },
+        vps: { backendUrl: '', agentToken: '', vncUrl: '' },
+      };
+      Object.assign(backends, prev.backends || {}, updates.backends || {});
+      const active = updates.activeBackend || prev.activeBackend || 'laptop';
+      const slotTouched =
+        updates.backendUrl !== undefined ||
+        updates.agentToken !== undefined ||
+        updates.vncUrl !== undefined;
+      if (slotTouched) {
+        const base = active === prev.activeBackend
+          ? { backendUrl: prev.backendUrl, agentToken: prev.agentToken, vncUrl: prev.vncUrl }
+          : backends[active];
+        backends[active] = {
+          backendUrl: updates.backendUrl !== undefined ? updates.backendUrl : base.backendUrl,
+          agentToken: updates.agentToken !== undefined ? updates.agentToken : base.agentToken,
+          vncUrl: updates.vncUrl !== undefined ? updates.vncUrl : base.vncUrl,
+        };
+      } else {
+        backends[prev.activeBackend || 'laptop'] = {
+          backendUrl: prev.backendUrl,
+          agentToken: prev.agentToken,
+          vncUrl: prev.vncUrl,
+        };
+      }
+      const next = withActive({
+        activeBackend: active,
+        backends,
+        demoMode: updates.demoMode !== undefined ? updates.demoMode : prev.demoMode,
+      });
+      saveConfig(next);
       return next;
     });
   };

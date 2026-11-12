@@ -9,6 +9,8 @@ Mobile control center + self-hosted Ubuntu backend for a personal browser agent.
 
 **Backup / testing:** **[GitHub Codespaces](./CODESPACES.md)** (free quota, not 24/7).
 
+**Android tablet (Termux):** **[android/README_HINDI.md](./android/README_HINDI.md)** — Redmi Pad / ARM64, F-Droid Termux + system Chromium over CDP. App Settings has a Laptop / Tablet / VPS switcher.
+
 **Cheap UPI VPS** (when you want the laptop off): **[PLATFORMS.md](./PLATFORMS.md)**. The backend also runs on **any Ubuntu 24.04 VPS** (x86_64 or ARM64). A 4 GB RAM plan is enough (the installer creates a swapfile and uses a light IceWM desktop). Oracle Always Free is optional if you can get an Ampere A1 VM.
 
 ## Quick start (frontend)

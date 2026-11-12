@@ -106,7 +106,7 @@ class MockLLM:
         return action, {"provider": "mock", "model": "mock-llm", "tokens_in": 0, "tokens_out": 0}
 
 
-async def decide_deepseek(prompt: str, screenshot_png: bytes) -> tuple[dict[str, Any], dict[str, Any]]:
+async def decide_deepseek(prompt: str, screenshot_png: bytes, mime: str = "image/png") -> tuple[dict[str, Any], dict[str, Any]]:
     b64 = base64.b64encode(screenshot_png).decode("ascii")
     body = {
         "model": DEEPSEEK_MODEL,
@@ -119,7 +119,7 @@ async def decide_deepseek(prompt: str, screenshot_png: bytes) -> tuple[dict[str,
                     {"type": "text", "text": prompt},
                     {
                         "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{b64}"},
+                        "image_url": {"url": f"data:{mime};base64,{b64}"},
                     },
                 ],
             },
@@ -157,7 +157,7 @@ async def decide_deepseek(prompt: str, screenshot_png: bytes) -> tuple[dict[str,
     return action, meta
 
 
-async def decide_gemini(prompt: str, screenshot_png: bytes) -> tuple[dict[str, Any], dict[str, Any]]:
+async def decide_gemini(prompt: str, screenshot_png: bytes, mime: str = "image/png") -> tuple[dict[str, Any], dict[str, Any]]:
     from google import genai
     from google.genai import types
 
@@ -165,7 +165,7 @@ async def decide_gemini(prompt: str, screenshot_png: bytes) -> tuple[dict[str, A
     response = await client.aio.models.generate_content(
         model=GEMINI_VISION_MODEL,
         contents=[
-            types.Part.from_bytes(data=screenshot_png, mime_type="image/png"),
+            types.Part.from_bytes(data=screenshot_png, mime_type=mime),
             SYSTEM_PROMPT + "\n\nTask:\n" + prompt,
         ],
     )
@@ -192,18 +192,18 @@ async def decide_gemini(prompt: str, screenshot_png: bytes) -> tuple[dict[str, A
     return action, meta
 
 
-async def decide(prompt: str, screenshot_png: bytes, mock: Optional[MockLLM] = None) -> tuple[dict[str, Any], dict[str, Any]]:
+async def decide(prompt: str, screenshot_png: bytes, mock: Optional[MockLLM] = None, mime: str = "image/png") -> tuple[dict[str, Any], dict[str, Any]]:
     if mock is not None:
         return await mock.decide(prompt, screenshot_png)
     if DRY_RUN:
         return await MockLLM().decide(prompt, screenshot_png)
     if DEEPSEEK_API_KEY:
         try:
-            return await decide_deepseek(prompt, screenshot_png)
+            return await decide_deepseek(prompt, screenshot_png, mime=mime)
         except Exception as exc:
             logger.warning("DeepSeek vision failed, falling back to Gemini: %s", exc)
     if GEMINI_API_KEY:
-        return await decide_gemini(prompt, screenshot_png)
+        return await decide_gemini(prompt, screenshot_png, mime=mime)
     raise RuntimeError("No vision LLM configured (set DEEPSEEK_API_KEY or GEMINI_API_KEY, or DRY_RUN=1)")
 
 
@@ -240,6 +240,16 @@ async def apply_action(page, action: dict[str, Any]) -> str:
     return f"Unknown action {kind}"
 
 
+
+async def _capture_screenshot(page) -> tuple[bytes, str]:
+    fmt = (SCREENSHOT_FORMAT or "png").lower()
+    if fmt in {"jpg", "jpeg"}:
+        data = await page.screenshot(type="jpeg", quality=max(1, min(SCREENSHOT_QUALITY, 100)), full_page=False)
+        return data, "image/jpeg"
+    data = await page.screenshot(type="png", full_page=False)
+    return data, "image/png"
+
+
 async def run_vision_task(
     page,
     task: str,
@@ -254,26 +264,27 @@ async def run_vision_task(
     history: list[dict[str, Any]] = []
     last_result = ""
     for step in range(1, steps + 1):
-        png = await page.screenshot(type="png", full_page=False)
+        image, mime = await _capture_screenshot(page)
         prompt = (
             f"Task: {task}\n"
             f"Step {step}/{steps}. URL: {page.url}\n"
             f"Last result: {last_result or 'none'}\n"
             "Decide the next single action."
         )
-        action, meta = await decide(prompt, png, mock=mock)
+        action, meta = await decide(prompt, image, mock=mock, mime=mime)
         if log:
-            await log(
-                {
-                    "type": "vision",
-                    "title": f"Vision step {step}: {action.get('action')}",
-                    "message": action.get("thought") or "",
-                    "coords": {"x": action.get("x") or 0, "y": action.get("y") or 0},
-                    "costInr": None,
-                    "meta": meta,
-                    "screenshotPngB64": base64.b64encode(png).decode("ascii") if step <= 8 else None,
-                }
-            )
+            payload = {
+                "type": "vision",
+                "title": f"Vision step {step}: {action.get('action')}",
+                "message": action.get("thought") or "",
+                "coords": {"x": action.get("x") or 0, "y": action.get("y") or 0},
+                "costInr": None,
+                "meta": meta,
+            }
+            if SCREENSHOT_TO_UI and step <= 8:
+                payload["screenshotPngB64"] = base64.b64encode(image).decode("ascii")
+                payload["screenshotMime"] = mime
+            await log(payload)
         last_result = await apply_action(page, action)
         history.append({"step": step, "action": action, "result": last_result, "meta": meta})
         if (action.get("action") or "").lower() == "done":

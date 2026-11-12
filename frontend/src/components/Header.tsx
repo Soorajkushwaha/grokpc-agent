@@ -1,5 +1,6 @@
 import React from 'react';
 import { useApp } from '../context/AppContext';
+import { BACKEND_OPTIONS } from '../types';
 import {
   Cpu,
   HardDrive,
@@ -59,7 +60,9 @@ export const Header: React.FC = () => {
                   {currentAgentTask || 'Agent executing workflow...'}
                 </span>
               ) : (
-                config.demoMode ? 'Demo mode — open Settings to connect your VM' : 'Oracle Cloud Ubuntu • Persistent Chrome'
+                config.demoMode
+                  ? 'Demo mode — open Settings to connect a laptop, tablet, or VPS'
+                  : ((BACKEND_OPTIONS.find((b) => b.id === config.activeBackend)?.label || 'Backend') + ' • ' + (config.backendUrl.replace(/^https?:\/\//, '') || 'connected'))
               )}
             </p>
           </div>

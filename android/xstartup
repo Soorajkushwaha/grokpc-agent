@@ -1,0 +1,7 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# Lightweight desktop for TigerVNC (1280x720). Used by GrokPC on the tablet.
+unset SESSION_MANAGER
+unset DBUS_SESSION_BUS_ADDRESS
+export DISPLAY="${DISPLAY:-:1}"
+[ -x "$PREFIX/bin/icewm-session" ] && exec icewm-session
+exec icewm

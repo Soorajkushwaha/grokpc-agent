@@ -1,6 +1,24 @@
+import type { BackendId, BackendSlot, ConnectionConfig } from './types';
+import { BACKEND_OPTIONS } from './types';
+
 const STORAGE_KEY = 'grokpc_config_v2';
 
+export type { BackendId, BackendSlot };
+export { BACKEND_OPTIONS };
+
+export const EMPTY_SLOT: BackendSlot = { backendUrl: '', agentToken: '', vncUrl: '' };
+
+export function emptyBackends(): Record<BackendId, BackendSlot> {
+  return {
+    laptop: { ...EMPTY_SLOT },
+    tablet: { ...EMPTY_SLOT },
+    vps: { ...EMPTY_SLOT },
+  };
+}
+
 export interface StoredConfig {
+  activeBackend: BackendId;
+  backends: Record<BackendId, BackendSlot>;
   backendUrl: string;
   agentToken: string;
   vncUrl: string;
@@ -8,38 +26,103 @@ export interface StoredConfig {
 }
 
 export const DEFAULT_STORED: StoredConfig = {
+  activeBackend: 'laptop',
+  backends: emptyBackends(),
   backendUrl: '',
   agentToken: '',
   vncUrl: '',
   demoMode: true,
 };
 
+function isBackendId(v: unknown): v is BackendId {
+  return v === 'laptop' || v === 'tablet' || v === 'vps';
+}
+
+export function withActive(
+  partial: Pick<StoredConfig, 'activeBackend' | 'backends' | 'demoMode'>,
+): StoredConfig {
+  const slot = partial.backends[partial.activeBackend] || EMPTY_SLOT;
+  return {
+    activeBackend: partial.activeBackend,
+    backends: {
+      laptop: { ...EMPTY_SLOT, ...(partial.backends.laptop || {}) },
+      tablet: { ...EMPTY_SLOT, ...(partial.backends.tablet || {}) },
+      vps: { ...EMPTY_SLOT, ...(partial.backends.vps || {}) },
+    },
+    backendUrl: slot.backendUrl,
+    agentToken: slot.agentToken,
+    vncUrl: slot.vncUrl,
+    demoMode: partial.demoMode,
+  };
+}
+
 export function loadConfig(): StoredConfig {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) return { ...DEFAULT_STORED, ...JSON.parse(raw) };
-    // migrate older key if present, but drop API keys
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed.backends && isBackendId(parsed.activeBackend)) {
+        return withActive({
+          activeBackend: parsed.activeBackend,
+          backends: { ...emptyBackends(), ...parsed.backends },
+          demoMode: Boolean(parsed.demoMode),
+        });
+      }
+      const slot: BackendSlot = {
+        backendUrl: parsed.backendUrl || '',
+        agentToken: parsed.agentToken || '',
+        vncUrl: parsed.vncUrl || '',
+      };
+      const backends = emptyBackends();
+      backends.laptop = slot;
+      return withActive({
+        activeBackend: 'laptop',
+        backends,
+        demoMode: parsed.demoMode !== false && !slot.backendUrl,
+      });
+    }
     const legacy = localStorage.getItem('oracle_agent_config');
     if (legacy) {
       const old = JSON.parse(legacy);
-      return {
+      const backends = emptyBackends();
+      backends.laptop = {
         backendUrl: old.backendUrl || '',
         agentToken: '',
         vncUrl: old.vncUrl || '',
-        demoMode: old.useSimulatedDesktop !== false && !old.backendUrl,
       };
+      return withActive({
+        activeBackend: 'laptop',
+        backends,
+        demoMode: old.useSimulatedDesktop !== false && !old.backendUrl,
+      });
     }
   } catch {
     /* ignore */
   }
-  return { ...DEFAULT_STORED };
+  return { ...DEFAULT_STORED, backends: emptyBackends() };
 }
 
-export function saveConfig(cfg: StoredConfig): void {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(cfg));
+export function saveConfig(cfg: StoredConfig | ConnectionConfig): void {
+  const active: BackendId = isBackendId((cfg as StoredConfig).activeBackend)
+    ? (cfg as StoredConfig).activeBackend
+    : 'laptop';
+  const backends = (cfg as StoredConfig).backends
+    ? { ...emptyBackends(), ...(cfg as StoredConfig).backends }
+    : emptyBackends();
+  backends[active] = {
+    backendUrl: cfg.backendUrl,
+    agentToken: cfg.agentToken,
+    vncUrl: cfg.vncUrl,
+  };
+  const stored = withActive({
+    activeBackend: active,
+    backends,
+    demoMode: cfg.demoMode,
+  });
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(stored));
 }
 
-export function isConfigured(cfg: StoredConfig): boolean {
+export function isConfigured(cfg: Pick<StoredConfig, 'backendUrl' | 'agentToken'>): boolean {
   return Boolean(cfg.backendUrl && cfg.agentToken);
 }
 

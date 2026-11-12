@@ -1,22 +1,44 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useApp } from '../../context/AppContext';
-import { X, Shield, Server, KeyRound, Monitor, Info } from 'lucide-react';
+import { BACKEND_OPTIONS, type BackendId, type BackendSlot } from '../../types';
+import { emptyBackends, isConfigured } from '../../api';
+import { X, Shield, Server, KeyRound, Monitor, Info, Laptop, Tablet, Cloud } from 'lucide-react';
+
+const ICONS: Record<BackendId, React.ReactNode> = {
+  laptop: <Laptop className="w-3.5 h-3.5" />,
+  tablet: <Tablet className="w-3.5 h-3.5" />,
+  vps: <Cloud className="w-3.5 h-3.5" />,
+};
 
 export const SettingsModal: React.FC = () => {
   const { config, updateConfig, isSettingsModalOpen, setIsSettingsModalOpen, refreshHealth, health, wsConnected } = useApp();
-  const [backendUrl, setBackendUrl] = useState(config.backendUrl);
-  const [agentToken, setAgentToken] = useState(config.agentToken);
-  const [vncUrl, setVncUrl] = useState(config.vncUrl);
+  const [active, setActive] = useState<BackendId>(config.activeBackend || 'laptop');
+  const [backends, setBackends] = useState(() => config.backends || emptyBackends());
   const [demoMode, setDemoMode] = useState(config.demoMode);
+
+  useEffect(() => {
+    if (!isSettingsModalOpen) return;
+    setActive(config.activeBackend || 'laptop');
+    setBackends(config.backends || emptyBackends());
+    setDemoMode(config.demoMode);
+  }, [isSettingsModalOpen, config]);
 
   if (!isSettingsModalOpen) return null;
 
+  const slot: BackendSlot = backends[active] || { backendUrl: '', agentToken: '', vncUrl: '' };
+  const patchSlot = (partial: Partial<BackendSlot>) => {
+    setBackends((prev) => ({ ...prev, [active]: { ...prev[active], ...partial } }));
+  };
+
   const handleSave = async () => {
-    const nextDemo = demoMode || !(backendUrl.trim() && agentToken.trim());
+    const chosen = backends[active] || { backendUrl: '', agentToken: '', vncUrl: '' };
+    const nextDemo = demoMode || !isConfigured(chosen);
     updateConfig({
-      backendUrl: backendUrl.trim().replace(/\/+$/, ''),
-      agentToken: agentToken.trim(),
-      vncUrl: vncUrl.trim(),
+      activeBackend: active,
+      backends,
+      backendUrl: chosen.backendUrl.trim().replace(/\/+$/, ''),
+      agentToken: chosen.agentToken.trim(),
+      vncUrl: chosen.vncUrl.trim(),
       demoMode: nextDemo,
     });
     setDemoMode(nextDemo);
@@ -40,16 +62,43 @@ export const SettingsModal: React.FC = () => {
         <div className="p-4 space-y-4">
           <p className="text-[11px] text-slate-400 flex items-start gap-1.5">
             <Info className="w-3.5 h-3.5 mt-0.5 text-cyan-500 shrink-0" />
-            API keys stay on the Oracle VM in /app/agent/.env. This phone app only stores the tunnel URL and a bearer token (localStorage is fine for a personal device).
+            API keys stay on the machine in ~/.grokpc/.env or /app/agent/.env. This app only stores tunnel URLs and a bearer token per backend (Laptop, Tablet, VPS).
           </p>
+
+          <div>
+            <span className="block text-xs font-semibold text-slate-300 mb-1.5">Active backend</span>
+            <div className="grid grid-cols-3 gap-1.5">
+              {BACKEND_OPTIONS.map((opt) => {
+                const filled = Boolean(backends[opt.id]?.backendUrl && backends[opt.id]?.agentToken);
+                const selected = active === opt.id;
+                return (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    onClick={() => setActive(opt.id)}
+                    className={`flex flex-col items-center gap-0.5 rounded-xl border px-2 py-2 cursor-pointer ${
+                      selected
+                        ? 'border-cyan-600 bg-cyan-950/70 text-white'
+                        : 'border-slate-800 bg-slate-900/60 text-slate-300 hover:border-slate-600'
+                    }`}
+                  >
+                    {ICONS[opt.id]}
+                    <span className="text-xs font-bold">{opt.label}</span>
+                    <span className="text-[10px] text-slate-400">{opt.hint}</span>
+                    {filled && <span className="text-[9px] font-mono text-emerald-400">saved</span>}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
 
           <label className="block space-y-1">
             <span className="flex items-center gap-1.5 text-xs font-semibold text-slate-300">
               <Server className="w-3.5 h-3.5 text-cyan-400" /> Cloudflare Tunnel URL (FastAPI)
             </span>
             <input
-              value={backendUrl}
-              onChange={(e) => setBackendUrl(e.target.value)}
+              value={slot.backendUrl}
+              onChange={(e) => patchSlot({ backendUrl: e.target.value })}
               placeholder="https://xxxx.trycloudflare.com"
               className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-sm text-white font-mono"
             />
@@ -61,9 +110,9 @@ export const SettingsModal: React.FC = () => {
             </span>
             <input
               type="password"
-              value={agentToken}
-              onChange={(e) => setAgentToken(e.target.value)}
-              placeholder="from /app/agent/.env  AGENT_TOKEN"
+              value={slot.agentToken}
+              onChange={(e) => patchSlot({ agentToken: e.target.value })}
+              placeholder="AGENT_TOKEN from the device .env"
               className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-sm text-white font-mono"
             />
           </label>
@@ -73,8 +122,8 @@ export const SettingsModal: React.FC = () => {
               <Monitor className="w-3.5 h-3.5 text-cyan-400" /> noVNC URL (optional)
             </span>
             <input
-              value={vncUrl}
-              onChange={(e) => setVncUrl(e.target.value)}
+              value={slot.vncUrl}
+              onChange={(e) => patchSlot({ vncUrl: e.target.value })}
               placeholder="Leave empty to use /novnc on the same tunnel"
               className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-sm text-white font-mono"
             />
@@ -89,7 +138,7 @@ export const SettingsModal: React.FC = () => {
             />
             <span>
               <span className="block text-sm font-semibold text-white">Demo mode</span>
-              <span className="block text-[11px] text-slate-400">Fake desktop and logs, no messages are sent. Turns off automatically once URL + token are saved, unless you leave this checked.</span>
+              <span className="block text-[11px] text-slate-400">Fake desktop and logs, no messages are sent. Turns off automatically once the selected backend has a URL + token, unless you leave this checked.</span>
             </span>
           </label>
 
@@ -103,7 +152,7 @@ export const SettingsModal: React.FC = () => {
             Cancel
           </button>
           <button onClick={() => void handleSave()} className="px-4 py-1.5 text-xs font-bold rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white cursor-pointer">
-            Save
+            Save & use {BACKEND_OPTIONS.find((b) => b.id === active)?.label}
           </button>
         </div>
       </div>
