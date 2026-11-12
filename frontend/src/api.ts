@@ -65,7 +65,7 @@ export function loadConfig(): StoredConfig {
         return withActive({
           activeBackend: parsed.activeBackend,
           backends: { ...emptyBackends(), ...parsed.backends },
-          demoMode: Boolean(parsed.demoMode),
+          demoMode: false,
         });
       }
       const slot: BackendSlot = {
@@ -78,7 +78,7 @@ export function loadConfig(): StoredConfig {
       return withActive({
         activeBackend: 'laptop',
         backends,
-        demoMode: parsed.demoMode !== false && !slot.backendUrl,
+        demoMode: false,
       });
     }
     const legacy = localStorage.getItem('oracle_agent_config');
@@ -93,7 +93,7 @@ export function loadConfig(): StoredConfig {
       return withActive({
         activeBackend: 'laptop',
         backends,
-        demoMode: old.useSimulatedDesktop !== false && !old.backendUrl,
+        demoMode: false,
       });
     }
   } catch {

@@ -67,7 +67,7 @@ export const SettingsScreen: React.FC = () => {
 
   const handleSave = () => {
     const chosen = backends[active] || { backendUrl: '', agentToken: '', vncUrl: '' };
-    const nextDemo = demoMode || !isConfigured(chosen);
+    const nextDemo = !isConfigured(chosen);
     updateConfig({
       activeBackend: active,
       backends,
@@ -137,10 +137,9 @@ export const SettingsScreen: React.FC = () => {
             className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm text-white font-mono"
           />
         </label>
-        <label className="flex items-center gap-2 text-sm text-slate-300 cursor-pointer">
-          <input type="checkbox" checked={demoMode} onChange={(e) => setDemoMode(e.target.checked)} />
-          Demo mode
-        </label>
+        {demoMode && (
+          <p className="text-[11px] text-amber-300">URL + token dono daal ke Save dabao — tab asli video banegi.</p>
+        )}
         <button
           onClick={handleSave}
           className="w-full py-2.5 rounded-xl bg-cyan-600 text-white text-sm font-bold cursor-pointer"

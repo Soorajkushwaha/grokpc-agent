@@ -131,7 +131,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       backendUrl: stored.backendUrl,
       agentToken: stored.agentToken,
       vncUrl: stored.vncUrl,
-      demoMode: stored.demoMode || !configured,
+      demoMode: !configured,
     };
   });
   const [health, setHealth] = useState<OracleSystemHealth>(config.demoMode ? DEMO_HEALTH : DEFAULT_HEALTH);
