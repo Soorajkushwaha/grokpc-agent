@@ -172,26 +172,156 @@ export function novncIframeUrl(
   return '';
 }
 
+export class ApiError extends Error {
+  status: number;
+  body: string;
+  constructor(status: number, statusText: string, body: string) {
+    const msg = status ? `${status} ${statusText}: ${body.slice(0, 300)}` : body.slice(0, 300);
+    super(msg);
+    this.name = 'ApiError';
+    this.status = status;
+    this.body = body;
+  }
+}
+
+export function isNetworkError(err: unknown): boolean {
+  if (err instanceof ApiError && err.status === 0) return true;
+  if (typeof TypeError !== 'undefined' && err instanceof TypeError) return true;
+  const name = err instanceof Error ? err.name : '';
+  if (name === 'AbortError' || name === 'TimeoutError') return true;
+  const msg = String(err instanceof Error ? err.message : err).toLowerCase();
+  return /failed to fetch|networkerror|load failed|abort|cors|timeout|network request failed/.test(msg);
+}
+
+const BACKEND_LABEL: Record<string, string> = {
+  laptop: 'Laptop',
+  tablet: 'Tablet',
+  vps: 'VPS',
+};
+
+export function friendlyError(err: unknown, backend?: BackendId, url?: string): string {
+  const label = (backend && BACKEND_LABEL[backend]) || 'Backend';
+  const isCf = (url || '').includes('trycloudflare.com');
+  if (isNetworkError(err)) {
+    if (isCf || backend === 'tablet') {
+      return `${label} URL purana ho sakta hai — Settings me naya URL daalo`;
+    }
+    return `${label} tak pahunch nahi paaye — Settings me URL check karo, aur device on hai na?`;
+  }
+  const status =
+    err instanceof ApiError
+      ? err.status
+      : Number((/\b(\d{3})\b/.exec(String(err instanceof Error ? err.message : err)) || [])[1] || 0);
+  const body = err instanceof ApiError ? err.body : String(err instanceof Error ? err.message : err);
+  if (status === 401 || status === 403) {
+    return `Token galat hai — Settings me ${label} ka URL aur token check karo`;
+  }
+  if (status === 409) {
+    return 'Ek video already ban raha hai — pehle uske khatam hone ka intezaar karo';
+  }
+  if (status === 404) {
+    return `${label} pe yeh API nahi mili — purana code ho sakta hai. Termux me git pull karke start.sh dobara chalao`;
+  }
+  if (status >= 500) {
+    return `${label} pe error aa gaya — thodi der baad try karo`;
+  }
+  try {
+    const parsed = JSON.parse(body);
+    if (typeof parsed.detail === 'string' && parsed.detail.trim()) return parsed.detail;
+  } catch {
+    /* ignore */
+  }
+  const raw = err instanceof Error ? err.message : String(err);
+  // Messages we already wrote in Hinglish (config / in-flight guards) — don't wrap them.
+  if (raw && !/^\d{3}\b/.test(raw) && raw.length < 360) return raw;
+  return `${label}: ${raw}`;
+}
+
+export function friendlyDownloadError(err: unknown, backend?: BackendId, url?: string): string {
+  const status = err instanceof ApiError ? err.status : 0;
+  if (status === 404) {
+    if (backend === 'tablet') {
+      return 'Download nahi hua — tablet pe purana code chal raha hai. Termux me `git pull` karke start.sh dobara chalao. Video Movies/GrokPC ya outputs folder mein ho sakti hai.';
+    }
+    return 'Video file nahi mili — shayad abhi ban rahi hai, ya is device pe purana code hai.';
+  }
+  return friendlyError(err, backend, url);
+}
+
+export async function apiFetchSlot<T = unknown>(
+  slot: Pick<BackendSlot, 'backendUrl' | 'agentToken'>,
+  path: string,
+  init: RequestInit = {},
+  timeoutMs = 12000,
+): Promise<T> {
+  if (!isConfigured(slot)) {
+    throw new ApiError(0, 'config', 'Backend URL and agent token are not set');
+  }
+  const headers = new Headers(init.headers);
+  headers.set('Authorization', `Bearer ${slot.agentToken}`);
+  if (init.body && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json');
+  }
+  const ctrl = new AbortController();
+  const onAbort = () => ctrl.abort();
+  if (init.signal) {
+    if (init.signal.aborted) ctrl.abort();
+    else init.signal.addEventListener('abort', onAbort, { once: true });
+  }
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(joinUrl(slot.backendUrl, path), { ...init, headers, signal: ctrl.signal });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new ApiError(res.status, res.statusText, text);
+    }
+    if (res.status === 204) return undefined as T;
+    return (await res.json()) as T;
+  } catch (err) {
+    if (err instanceof ApiError) throw err;
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      throw new ApiError(0, 'timeout', 'Request timeout');
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+    if (init.signal) init.signal.removeEventListener('abort', onAbort);
+  }
+}
+
 export async function apiFetch<T = unknown>(
   cfg: StoredConfig,
   path: string,
   init: RequestInit = {},
 ): Promise<T> {
   if (!isConfigured(cfg)) {
-    throw new Error('Backend URL and agent token are not set');
+    throw new ApiError(0, 'config', 'Backend URL and agent token are not set');
   }
-  const headers = new Headers(init.headers);
-  headers.set('Authorization', `Bearer ${cfg.agentToken}`);
-  if (init.body && !headers.has('Content-Type')) {
-    headers.set('Content-Type', 'application/json');
-  }
-  const res = await fetch(joinUrl(cfg.backendUrl, path), { ...init, headers });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`${res.status} ${res.statusText}: ${text.slice(0, 300)}`);
-  }
-  if (res.status === 204) return undefined as T;
-  return (await res.json()) as T;
+  return apiFetchSlot<T>(cfg, path, init);
+}
+
+export interface JobPreview {
+  ok: boolean;
+  job_id: string;
+  status: string;
+  current_step: string;
+  topic?: string;
+  log_line: string;
+  source: 'still' | 'video_frame' | null;
+  mime?: string | null;
+  image_b64?: string | null;
+  has_video?: boolean;
+  updated_at?: string;
+  note?: string;
+}
+
+export async function fetchJobPreview(slot: Pick<BackendSlot, 'backendUrl' | 'agentToken'>, jobId: string): Promise<JobPreview> {
+  return apiFetchSlot<JobPreview>(slot, `/api/jobs/${encodeURIComponent(jobId)}/preview`, {}, 15000);
+}
+
+export function previewDataUrl(preview: JobPreview | null | undefined): string | null {
+  if (!preview?.image_b64) return null;
+  return `data:${preview.mime || 'image/jpeg'};base64,${preview.image_b64}`;
 }
 
 function filenameFromDisposition(header: string | null): string | null {
@@ -216,10 +346,10 @@ export async function downloadJobVideo(
   onProgress?: (percent: number | null) => void,
 ): Promise<string> {
   if (cfg.demoMode) {
-    throw new Error('Demo mode me download nahi ho sakta');
+    throw new ApiError(0, 'demo', 'Demo mode me download nahi ho sakta');
   }
   if (!isConfigured(cfg)) {
-    throw new Error('Backend URL aur token set nahi hai');
+    throw new ApiError(0, 'config', 'Backend URL aur token set nahi hai');
   }
   onProgress?.(0);
   const res = await fetch(joinUrl(cfg.backendUrl, `/api/jobs/${encodeURIComponent(jobId)}/download`), {
@@ -227,13 +357,7 @@ export async function downloadJobVideo(
   });
   if (!res.ok) {
     const text = await res.text();
-    if (res.status === 404) {
-      throw new Error('Video file nahi mili');
-    }
-    if (res.status === 401) {
-      throw new Error('Token galat hai — Settings me worker URL/token check karo');
-    }
-    throw new Error(`${res.status} ${res.statusText}: ${text.slice(0, 300)}`);
+    throw new ApiError(res.status, res.statusText, text);
   }
   const total = Number(res.headers.get('Content-Length') || 0);
   let blob: Blob;
@@ -250,7 +374,7 @@ export async function downloadJobVideo(
         onProgress?.(Math.min(99, Math.round((received / total) * 100)));
       }
     }
-    blob = new Blob(chunks, { type: res.headers.get('Content-Type') || 'video/mp4' });
+    blob = new Blob(chunks as BlobPart[], { type: res.headers.get('Content-Type') || 'video/mp4' });
   } else {
     onProgress?.(null);
     blob = await res.blob();

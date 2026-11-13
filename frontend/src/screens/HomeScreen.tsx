@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import { useApp } from '../context/AppContext';
 import {
   Plus,
@@ -11,14 +11,22 @@ import {
   Lightbulb,
   Smile,
   Bot,
-  ChevronRight,
   Laptop,
   Tablet,
   Cloud,
+  AlertCircle,
 } from 'lucide-react';
 import { channelTheme, initials } from '../ui';
-import { BACKEND_OPTIONS, STEP_LABELS, type BackendId } from '../types';
-import { isConfigured } from '../api';
+import { BACKEND_OPTIONS, type BackendId, type Job } from '../types';
+import {
+  downloadJobVideo,
+  friendlyDownloadError,
+  friendlyError,
+  isConfigured,
+} from '../api';
+import { isActiveJob } from '../deviceStatus';
+import { DeviceStatusCards } from '../components/DeviceStatusCards';
+import { JobProgressCard, SubmittingBanner } from '../components/JobProgressCard';
 
 const TOPIC_CHIPS: { label: string; Icon: React.ComponentType<{ className?: string }> }[] = [
   { label: 'Horror kahani', Icon: Ghost },
@@ -26,6 +34,12 @@ const TOPIC_CHIPS: { label: string; Icon: React.ComponentType<{ className?: stri
   { label: 'Facts', Icon: Lightbulb },
   { label: 'Kids story', Icon: Smile },
 ];
+
+const WORKER_ICONS: Record<BackendId, React.ReactNode> = {
+  laptop: <Laptop className="w-3.5 h-3.5" />,
+  tablet: <Tablet className="w-3.5 h-3.5" />,
+  vps: <Cloud className="w-3.5 h-3.5" />,
+};
 
 export const HomeScreen: React.FC = () => {
   const {
@@ -41,22 +55,35 @@ export const HomeScreen: React.FC = () => {
     config,
     updateConfig,
     refreshHealth,
+    devices,
+    trackedJobs,
   } = useApp();
   const [topic, setTopic] = useState('');
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [pendingTopic, setPendingTopic] = useState<string | null>(null);
+  const [dl, setDl] = useState<{ device: BackendId; jobId: string; progress: number | null } | null>(null);
+  const [dlErrors, setDlErrors] = useState<Partial<Record<string, string>>>({});
+  const busyRef = useRef(false);
+
   const spend = budget.spendInrToday ?? budget.currentSpendInr ?? 0;
   const videosToday = status?.today.videos ?? budget.videosToday ?? 0;
   const videoCap = status?.today.videoCap ?? budget.dailyVideoCap ?? 3;
   const spendCap = status?.today.spendCapInr ?? budget.dailySpendCapInr ?? 40;
-  const running = jobs.find((j) => j.status === 'running' || j.status === 'queued');
   const autoFeature = Boolean(status?.features?.autopilot);
   const autoOn = Boolean(status?.autopilot?.enabled);
 
-  const WORKER_ICONS: Record<BackendId, React.ReactNode> = {
-    laptop: <Laptop className="w-3.5 h-3.5" />,
-    tablet: <Tablet className="w-3.5 h-3.5" />,
-    vps: <Cloud className="w-3.5 h-3.5" />,
-  };
+  const activeId: BackendId = config.activeBackend || 'laptop';
+  const activeLabel = BACKEND_OPTIONS.find((b) => b.id === activeId)?.label || 'Laptop';
+  const snap = devices[activeId];
+  const runningOnSelected =
+    isActiveJob(snap?.currentJob) || jobs.some((j) => isActiveJob(j));
+  const watchJob: Job | null =
+    snap?.currentJob ||
+    (snap?.latestJob && trackedJobs[activeId]?.id === snap.latestJob.id ? snap.latestJob : null) ||
+    jobs.find((j) => isActiveJob(j)) ||
+    jobs.find((j) => trackedJobs[activeId]?.id === j.id) ||
+    null;
 
   const switchWorker = (id: BackendId) => {
     const slot = config.backends?.[id] || { backendUrl: '', agentToken: '', vncUrl: '' };
@@ -68,17 +95,67 @@ export const HomeScreen: React.FC = () => {
       vncUrl: slot.vncUrl,
       demoMode: !isConfigured(slot),
     });
+    setError(null);
     setTimeout(() => void refreshHealth(), 50);
   };
 
   const submit = async () => {
-    if (!topic.trim() || busy) return;
+    const trimmed = topic.trim();
+    if (!trimmed || busyRef.current) return;
+    if (runningOnSelected) {
+      setError('Ek video already ban raha hai — pehle uske khatam hone ka intezaar karo');
+      return;
+    }
+    busyRef.current = true;
     setBusy(true);
+    setError(null);
+    setPendingTopic(trimmed);
     try {
-      await createVideoJob(topic.trim());
+      await createVideoJob(trimmed);
       setTopic('');
+    } catch (err) {
+      setError(friendlyError(err, activeId, config.backendUrl));
     } finally {
+      busyRef.current = false;
       setBusy(false);
+      setPendingTopic(null);
+    }
+  };
+
+  const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      void submit();
+    }
+  };
+
+  const handleDownload = async (deviceId: BackendId, job: Job) => {
+    if (dl) return;
+    const slot = config.backends?.[deviceId] || {
+      backendUrl: config.backendUrl,
+      agentToken: config.agentToken,
+      vncUrl: config.vncUrl,
+    };
+    const key = `${deviceId}:${job.id}`;
+    setDl({ device: deviceId, jobId: job.id, progress: 0 });
+    setDlErrors((prev) => {
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
+    try {
+      await downloadJobVideo(
+        { ...config, ...slot, backendUrl: slot.backendUrl, agentToken: slot.agentToken, vncUrl: slot.vncUrl },
+        job.id,
+        (pct) => setDl((cur) => (cur && cur.jobId === job.id ? { ...cur, progress: pct } : cur)),
+      );
+    } catch (err) {
+      setDlErrors((prev) => ({
+        ...prev,
+        [key]: friendlyDownloadError(err, deviceId, slot.backendUrl),
+      }));
+    } finally {
+      setDl(null);
     }
   };
 
@@ -132,7 +209,7 @@ export const HomeScreen: React.FC = () => {
         <div className="grid grid-cols-3 gap-1.5">
           {BACKEND_OPTIONS.map((opt) => {
             const filled = Boolean(config.backends?.[opt.id]?.backendUrl && config.backends?.[opt.id]?.agentToken);
-            const selected = (config.activeBackend || 'laptop') === opt.id;
+            const selected = activeId === opt.id;
             return (
               <button
                 key={opt.id}
@@ -155,7 +232,7 @@ export const HomeScreen: React.FC = () => {
             );
           })}
         </div>
-        {(config.activeBackend || 'laptop') === 'tablet' && (
+        {activeId === 'tablet' && (
           <p className="mt-2 text-[11px] text-slate-400">
             Tablet worker: kahani + awaz + FFmpeg basic visuals. Grok / Google Vids clips ke liye Laptop chuno.
           </p>
@@ -171,11 +248,13 @@ export const HomeScreen: React.FC = () => {
           <textarea
             value={topic}
             onChange={(e) => setTopic(e.target.value)}
+            onKeyDown={onKeyDown}
             rows={4}
             placeholder="Jaise: Paani bachane ke 3 aasan tarike"
             className="field mt-2.5 w-full rounded-2xl px-4 py-3.5 text-[15px] text-white resize-none leading-relaxed"
           />
         </label>
+        <p className="text-[11px] text-slate-500 -mt-1.5">Enter = start · Shift+Enter = nayi line</p>
         <div className="grid grid-cols-2 gap-1.5">
           {TOPIC_CHIPS.map((chip) => {
             const Icon = chip.Icon;
@@ -199,31 +278,53 @@ export const HomeScreen: React.FC = () => {
         </div>
         <button
           onClick={() => void submit()}
-          disabled={busy || !topic.trim()}
+          disabled={busy || !topic.trim() || runningOnSelected}
           className="w-full py-3.5 min-h-[52px] rounded-2xl bg-gradient-to-r from-cyan-500 to-blue-600 text-white text-base font-bold shadow-lg shadow-cyan-900/40 disabled:opacity-50 disabled:shadow-none cursor-pointer flex items-center justify-center gap-2 transition-transform active:scale-[0.98] hover:brightness-110"
         >
           <Sparkles className="w-5 h-5" />
-          {busy ? 'Start ho rahi hai…' : 'Nayi Video Banao'}
+          {busy
+            ? `${activeLabel} pe start ho rahi hai…`
+            : runningOnSelected
+              ? 'Ek video already ban raha hai'
+              : 'Nayi Video Banao'}
         </button>
       </section>
 
-      {running && (
-        <button
-          onClick={() => setActiveTab('jobs')}
-          className="w-full text-left bg-cyan-950/50 border border-cyan-700/40 rounded-2xl px-4 py-3 cursor-pointer flex items-center gap-3 hover:border-cyan-500/50 transition-colors"
+      {error && (
+        <div
+          role="alert"
+          className="rounded-2xl border border-rose-700/40 bg-rose-950/60 px-4 py-3 text-sm text-rose-100 flex items-start gap-2"
         >
-          <span className="relative flex h-9 w-9 shrink-0 items-center justify-center">
-            <span className="absolute inset-0 rounded-full bg-cyan-400/20 step-running" />
-            <Clapperboard className="w-4 h-4 text-cyan-300 relative" />
-          </span>
-          <span className="min-w-0 flex-1">
-            <span className="block text-[11px] uppercase tracking-wide text-cyan-400 font-semibold">Abhi chal raha hai</span>
-            <span className="block text-sm text-white font-medium truncate">{running.topic}</span>
-            <span className="block text-[11px] text-slate-400">{STEP_LABELS[running.current_step] || running.current_step} · {running.status}</span>
-          </span>
-          <ChevronRight className="w-4 h-4 text-slate-500 shrink-0" />
-        </button>
+          <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+          <span className="break-words">{error}</span>
+        </div>
       )}
+
+      {pendingTopic && !watchJob && <SubmittingBanner deviceId={activeId} topic={pendingTopic} />}
+
+      {watchJob && (
+        <JobProgressCard
+          job={watchJob}
+          deviceId={activeId}
+          startedAt={trackedJobs[activeId]?.id === watchJob.id ? trackedJobs[activeId]?.startedAt : undefined}
+          onDownload={() => void handleDownload(activeId, watchJob)}
+          downloading={Boolean(dl && dl.jobId === watchJob.id)}
+          downloadProgress={dl && dl.jobId === watchJob.id ? dl.progress : null}
+          downloadError={dlErrors[`${activeId}:${watchJob.id}`] || null}
+        />
+      )}
+
+      <DeviceStatusCards
+        devices={devices}
+        backends={config.backends || {
+          laptop: { backendUrl: '', agentToken: '', vncUrl: '' },
+          tablet: { backendUrl: '', agentToken: '', vncUrl: '' },
+          vps: { backendUrl: '', agentToken: '', vncUrl: '' },
+        }}
+        onDownload={(id, job) => void handleDownload(id, job)}
+        downloading={dl}
+        downloadErrors={dlErrors}
+      />
 
       <section className="grid grid-cols-3 gap-2">
         <div className="card p-3 text-center">

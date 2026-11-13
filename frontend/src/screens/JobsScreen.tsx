@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { useApp } from '../context/AppContext';
-import { downloadJobVideo } from '../api';
+import { downloadJobVideo, friendlyDownloadError } from '../api';
 import { STEP_LABELS, type Job, type JobStep } from '../types';
 import {
   Pause,
@@ -144,7 +144,7 @@ const JobCard: React.FC<{ job: Job; onToast?: (kind: 'ok' | 'error', text: strin
       const name = await downloadJobVideo(config, job.id, (pct) => setProgress(pct));
       onToast?.('ok', `${name} download ho gayi`);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = friendlyDownloadError(err, config.activeBackend, config.backendUrl);
       onToast?.('error', msg || 'Download fail ho gaya');
     } finally {
       setDownloading(false);

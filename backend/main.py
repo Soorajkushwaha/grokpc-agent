@@ -17,7 +17,7 @@ from typing import Any, Optional
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from starlette.websockets import WebSocket, WebSocketDisconnect
@@ -40,6 +40,7 @@ from config import (
 from db import budget_summary, init_db, today_stats
 from desktop_client import helper_status
 from jobs import (
+    active_job,
     append_log,
     cancel_job,
     create_job,
@@ -51,6 +52,7 @@ from jobs import (
     running_job,
     update_job,
 )
+from job_preview import build_preview
 from novnc_proxy import router as novnc_router
 from pipeline import PipelineRunner
 from runtime_settings import load_settings, save_settings
@@ -220,6 +222,7 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
+    expose_headers=["Content-Disposition"],
 )
 app.include_router(novnc_router)
 
@@ -421,6 +424,14 @@ async def api_create_job(req: JobIn, _auth: str = Depends(require_auth)):
         # but prefer known channels.
         if not req.channel_id.startswith("ch"):
             raise HTTPException(status_code=404, detail="Unknown channel")
+    current = active_job()
+    if current:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Ek video already ban raha hai ({current['id']}, {current['status']})"
+            ),
+        )
     job = create_job(
         channel_id=req.channel_id,
         topic=topic,
@@ -469,6 +480,32 @@ def _job_video_file(job: dict[str, Any]) -> Path | None:
 def _download_filename(job_id: str) -> str:
     safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in job_id)[:80] or "job"
     return f"GrokPC_{safe}.mp4"
+
+
+@app.get("/api/jobs/{job_id}/preview")
+async def api_job_preview(
+    job_id: str,
+    format: str = "json",
+    _auth: str = Depends(require_auth),
+):
+    """Latest scene still or a frame from the partial/final video, plus the
+    current log line. Auth: Bearer or ?token=. Not a live device-screen mirror.
+    """
+    preview = build_preview(job_id)
+    if not preview:
+        raise HTTPException(status_code=404, detail="Unknown job")
+    if format == "image":
+        raw = preview.get("image_b64")
+        if not raw:
+            raise HTTPException(status_code=404, detail="No preview yet")
+        import base64
+
+        return Response(
+            content=base64.b64decode(raw),
+            media_type=preview.get("mime") or "image/jpeg",
+            headers={"Cache-Control": "no-store"},
+        )
+    return JSONResponse(preview, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/jobs/{job_id}/download")

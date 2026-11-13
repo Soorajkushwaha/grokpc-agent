@@ -11,7 +11,17 @@ import type {
   RuntimeSettings,
   StyleProfile,
 } from '../types';
-import { apiFetch, isConfigured, loadConfig, novncIframeUrl, saveConfig, StoredConfig, withActive, wsUrl } from '../api';
+import { apiFetch, friendlyError, isConfigured, loadConfig, novncIframeUrl, saveConfig, StoredConfig, withActive, wsUrl } from '../api';
+import { BACKEND_OPTIONS, type BackendId } from '../types';
+import {
+  emptyDevices,
+  isActiveJob,
+  loadActiveJobs,
+  saveActiveJob,
+  snapshotAllDevices,
+  type DeviceSnapshot,
+  type TrackedJob,
+} from '../deviceStatus';
 
 interface AppContextType {
   activeTab: TabType;
@@ -31,6 +41,9 @@ interface AppContextType {
   jobs: Job[];
   refreshJobs: () => Promise<void>;
   createVideoJob: (topic: string, idea?: string) => Promise<Job | null>;
+  devices: Record<BackendId, DeviceSnapshot>;
+  refreshDevices: () => Promise<void>;
+  trackedJobs: Partial<Record<BackendId, TrackedJob>>;
   pauseJob: (id: string) => Promise<void>;
   resumeJob: (id: string) => Promise<void>;
   cancelJob: (id: string) => Promise<void>;
@@ -140,6 +153,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [channels, setChannels] = useState<Channel[]>(DEMO_CHANNELS);
   const [selectedChannelId, setSelectedChannelId] = useState('ch1');
   const [jobs, setJobs] = useState<Job[]>([]);
+  const [devices, setDevices] = useState<Record<BackendId, DeviceSnapshot>>(() => emptyDevices());
+  const [trackedJobs, setTrackedJobs] = useState<Partial<Record<BackendId, TrackedJob>>>(() => loadActiveJobs());
   const [logs, setLogs] = useState<AgentLogEntry[]>([]);
   const [showLogs, setShowLogs] = useState(false);
   const [isAgentRunning, setIsAgentRunning] = useState(false);
@@ -152,6 +167,15 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const wsRef = useRef<WebSocket | null>(null);
   const configRef = useRef(config);
   configRef.current = config;
+  const jobsRef = useRef(jobs);
+  jobsRef.current = jobs;
+  const devicesRef = useRef(devices);
+  devicesRef.current = devices;
+  const trackedRef = useRef(trackedJobs);
+  trackedRef.current = trackedJobs;
+  const selectedChannelRef = useRef(selectedChannelId);
+  selectedChannelRef.current = selectedChannelId;
+  const runningRef = useRef(false);
 
   const addLog = useCallback((log: Omit<AgentLogEntry, 'id' | 'timestamp'>) => {
     const entry: AgentLogEntry = {
@@ -257,6 +281,37 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }
   }, []);
 
+  const refreshDevices = useCallback(async () => {
+    const cfg = configRef.current;
+    const backends = cfg.backends || {
+      laptop: { backendUrl: '', agentToken: '', vncUrl: '' },
+      tablet: { backendUrl: '', agentToken: '', vncUrl: '' },
+      vps: { backendUrl: '', agentToken: '', vncUrl: '' },
+    };
+    const preferred: Partial<Record<BackendId, string>> = {};
+    const tracked = trackedRef.current;
+    for (const id of ['laptop', 'tablet', 'vps'] as BackendId[]) {
+      if (tracked[id]?.id) preferred[id] = tracked[id]!.id;
+    }
+    try {
+      const snaps = await snapshotAllDevices(backends, preferred);
+      setDevices(snaps);
+      const anyRunning = Object.values(snaps).some((s) => isActiveJob(s.currentJob));
+      runningRef.current = anyRunning;
+      // If we discovered a running job we weren't tracking (e.g. started elsewhere), persist it.
+      for (const id of ['laptop', 'tablet', 'vps'] as BackendId[]) {
+        const job = snaps[id].currentJob;
+        if (job && isActiveJob(job) && trackedRef.current[id]?.id !== job.id) {
+          const entry = { id: job.id, startedAt: Date.now(), topic: job.topic };
+          saveActiveJob(id, entry);
+          setTrackedJobs((prev) => ({ ...prev, [id]: entry }));
+        }
+      }
+    } catch {
+      /* ignore transient */
+    }
+  }, []);
+
   const refreshHealth = useCallback(async () => {
     const cfg = configRef.current;
     if (cfg.demoMode || !isConfigured(cfg)) {
@@ -316,53 +371,63 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     void refreshHealth();
     void refreshChannels();
     void refreshJobs();
-    if (config.demoMode || !isConfigured(toStored(config))) return;
-    const t = setInterval(() => {
-      void refreshHealth();
-      void refreshJobs();
-    }, 8000);
-    return () => clearInterval(t);
-  }, [config.backendUrl, config.agentToken, config.demoMode, refreshHealth, refreshChannels, refreshJobs]);
+    void refreshDevices();
+    let cancelled = false;
+    let timer: number | undefined;
+    const loop = () => {
+      const ms = runningRef.current ? 2500 : 7000;
+      timer = window.setTimeout(async () => {
+        if (cancelled) return;
+        await Promise.all([refreshHealth(), refreshJobs(), refreshDevices()]);
+        if (!cancelled) loop();
+      }, ms);
+    };
+    loop();
+    return () => {
+      cancelled = true;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [config.backendUrl, config.agentToken, config.demoMode, config.backends, refreshHealth, refreshChannels, refreshJobs, refreshDevices]);
 
   const createVideoJob = async (topic: string, idea = ''): Promise<Job | null> => {
     const trimmed = topic.trim();
     if (!trimmed) return null;
     const cfg = configRef.current;
+    const activeId: BackendId = cfg.activeBackend || 'laptop';
+    const label = BACKEND_OPTIONS.find((b) => b.id === activeId)?.label || 'Backend';
     if (cfg.demoMode || !isConfigured(cfg)) {
-      const demo: Job = {
-        id: `demo-${Date.now()}`,
-        channel_id: selectedChannelId,
-        topic: trimmed,
-        idea,
-        status: 'completed',
-        current_step: 'edit',
-        plan: { title: trimmed, voiceover_script: trimmed, story: 'Demo plan — backend connect karo to real video banegi.' },
-        final_path: '(demo — koi file nahi bani)',
-        steps: [
-          { name: 'story', status: 'success', detail: 'demo' },
-          { name: 'voiceover', status: 'success', detail: 'demo' },
-          { name: 'visuals', status: 'skipped', detail: 'demo — login ke baad asli clips' },
-          { name: 'edit', status: 'success', detail: 'demo' },
-        ],
-        created_at: new Date().toISOString(),
-      };
-      setJobs((prev) => [demo, ...prev]);
-      addLog({ type: 'system', title: 'Demo job', message: 'Settings me Laptop URL + token daalo, tab asli video banegi.' });
-      setActiveTab('jobs');
-      return demo;
+      const message = `Pehle Settings me ${label} ka URL + token daalo, tab asli video banegi.`;
+      addLog({ type: 'error', title: 'Job nahi bani', message });
+      throw new Error(message);
+    }
+    const existing =
+      devicesRef.current[activeId]?.currentJob ||
+      jobsRef.current.find((j) => isActiveJob(j)) ||
+      null;
+    if (existing && isActiveJob(existing)) {
+      const message = 'Ek video already ban raha hai — pehle uske khatam hone ka intezaar karo';
+      addLog({ type: 'error', title: 'Job nahi bani', message });
+      throw new Error(message);
     }
     try {
       const r = await apiFetch<{ job: Job }>(toStored(cfg), '/api/jobs', {
         method: 'POST',
-        body: JSON.stringify({ channel_id: selectedChannelId, topic: trimmed, idea }),
+        body: JSON.stringify({ channel_id: selectedChannelRef.current, topic: trimmed, idea }),
       });
-      addLog({ type: 'system', title: 'Nayi video', message: trimmed });
-      await refreshJobs();
-      setActiveTab('jobs');
-      return r.job;
+      const job = r.job;
+      addLog({ type: 'system', title: 'Nayi video', message: `${trimmed} · ${label}` });
+      setJobs((prev) => [job, ...prev.filter((j) => j.id !== job.id)]);
+      const entry = { id: job.id, startedAt: Date.now(), topic: job.topic };
+      saveActiveJob(activeId, entry);
+      setTrackedJobs((prev) => ({ ...prev, [activeId]: entry }));
+      runningRef.current = true;
+      void refreshJobs();
+      void refreshDevices();
+      return job;
     } catch (err) {
-      addLog({ type: 'error', title: 'Job nahi bani', message: String(err) });
-      return null;
+      const message = friendlyError(err, activeId, cfg.backendUrl);
+      addLog({ type: 'error', title: 'Job nahi bani', message });
+      throw (err instanceof Error ? err : new Error(message));
     }
   };
 
@@ -507,6 +572,9 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         jobs,
         refreshJobs,
         createVideoJob,
+        devices,
+        refreshDevices,
+        trackedJobs,
         pauseJob: (id) => jobAction(id, `/api/jobs/${id}/pause`, 'Paused'),
         resumeJob: (id) => jobAction(id, `/api/jobs/${id}/resume`, 'Resumed'),
         cancelJob: (id) => jobAction(id, `/api/jobs/${id}/cancel`, 'Cancelled'),

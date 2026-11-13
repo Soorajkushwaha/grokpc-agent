@@ -242,7 +242,7 @@ def list_steps(job_id: str) -> list[dict[str, Any]]:
 def list_logs(job_id: str, limit: int = 100) -> list[dict[str, Any]]:
     conn = connect()
     rows = conn.execute(
-        "SELECT * FROM job_logs WHERE job_id = ? ORDER BY created_at DESC LIMIT ?",
+        "SELECT * FROM job_logs WHERE job_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?",
         (job_id, int(limit)),
     ).fetchall()
     conn.close()
@@ -376,6 +376,28 @@ def running_job() -> Optional[dict[str, Any]]:
     conn = connect()
     row = conn.execute(
         "SELECT * FROM jobs WHERE status = 'running' ORDER BY updated_at DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+    return _row_job(row) if row else None
+
+
+# A job that should block a new POST /api/jobs (single-user, one at a time).
+ACTIVE_STATUSES = ("running", "queued", "waiting_login", "waiting_credits")
+
+
+def active_job() -> Optional[dict[str, Any]]:
+    conn = connect()
+    row = conn.execute(
+        """
+        SELECT * FROM jobs
+        WHERE status IN ('running', 'queued', 'waiting_login', 'waiting_credits')
+        ORDER BY CASE status
+            WHEN 'running' THEN 0
+            WHEN 'queued' THEN 1
+            ELSE 2
+        END, updated_at DESC
+        LIMIT 1
+        """
     ).fetchone()
     conn.close()
     return _row_job(row) if row else None

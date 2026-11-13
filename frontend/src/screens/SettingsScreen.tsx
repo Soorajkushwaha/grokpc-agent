@@ -133,6 +133,15 @@ export const SettingsScreen: React.FC = () => {
             );
           })}
         </div>
+        {active === 'vps' && (
+          <p className="text-[11px] text-slate-300 flex items-start gap-1.5 bg-slate-900/80 border border-white/8 rounded-xl px-2.5 py-2">
+            <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0 text-cyan-300" />
+            <span>
+              Teesra worker (VPS / cloud). URL + token daal ke Save karo. Khali chhodoge toh Home pe
+              "not configured" dikhega — same card UI jaise Laptop aur Tablet.
+            </span>
+          </p>
+        )}
         {active === 'tablet' && (
           <p className="text-[11px] text-cyan-200/90 flex items-start gap-1.5 bg-cyan-950/40 border border-cyan-800/30 rounded-xl px-2.5 py-2">
             <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" />
