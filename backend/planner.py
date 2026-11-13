@@ -7,6 +7,7 @@ be tested without network or a browser.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -249,18 +250,44 @@ def normalize_plan(raw: dict[str, Any], topic: str) -> dict[str, Any]:
     if not (out.get("voiceover_script") or "").strip():
         parts = [s.get("narration") for s in out["scenes"] if s.get("narration")]
         out["voiceover_script"] = " ".join(parts) or base["voiceover_script"]
+    out["word_count"] = len((out.get("voiceover_script") or "").split())
     return out
 
 
-def build_prompt(topic: str, idea: str, channel: Optional[dict[str, Any]], profile: Optional[dict[str, Any]] = None) -> str:
+def build_prompt(
+    topic: str,
+    idea: str,
+    channel: Optional[dict[str, Any]],
+    profile: Optional[dict[str, Any]] = None,
+    target: Any = None,
+) -> str:
     brief = planner_brief(profile or load_profile(), channel)
     extra = f"\nExtra idea / notes from the creator: {idea.strip()}\n" if (idea or "").strip() else ""
+    hint = PLAN_SCHEMA_HINT
+    length_line = ""
+    if target is not None:
+        try:
+            from duration_target import plan_schema_hint
+            hint = plan_schema_hint(target, language=(channel or {}).get("language") or "Hindi")
+            length_line = (
+                f"\nRequested length: {target.minutes:g} minutes, "
+                f"{target.word_min}–{target.word_max} words, about {target.scene_count} scenes "
+                f"of {target.scene_sec}s. Honor this. Do not summarize into a 1-minute recap.\n"
+            )
+        except Exception:
+            hint = PLAN_SCHEMA_HINT
+    topic_clip = (topic or "").strip()
+    # Bound enormous pastes so a single short-form call stays reasonable;
+    # long-form planning uses chapter excerpts instead.
+    if target is None or not getattr(target, "is_long", False):
+        topic_clip = topic_clip[:8000]
     return (
         "You are planning a YouTube video for this creator. Think the way they think.\n\n"
         f"{brief}\n\n"
-        f"Topic: {topic.strip()}\n"
-        f"{extra}\n"
-        f"{PLAN_SCHEMA_HINT}\n"
+        f"Topic: {topic_clip}\n"
+        f"{extra}"
+        f"{length_line}\n"
+        f"{hint}\n"
         "Fill every field. The voiceover_script must be speakable as-is."
     )
 
@@ -271,6 +298,7 @@ async def plan_with_deepseek(prompt: str) -> tuple[dict[str, Any], dict[str, Any
     body = {
         "model": DEEPSEEK_MODEL,
         "temperature": 0.6,
+        "max_tokens": 8192,
         "messages": [
             {
                 "role": "system",
@@ -282,7 +310,7 @@ async def plan_with_deepseek(prompt: str) -> tuple[dict[str, Any], dict[str, Any
             {"role": "user", "content": prompt},
         ],
     }
-    async with httpx.AsyncClient(timeout=90.0) as client:
+    async with httpx.AsyncClient(timeout=180.0) as client:
         resp = await client.post(
             f"{DEEPSEEK_BASE_URL.rstrip('/')}/chat/completions",
             headers={
@@ -332,10 +360,11 @@ def _gemini_text(data: dict[str, Any]) -> str:
     return "\n".join(texts)
 
 
-async def plan_with_gemini(prompt: str) -> tuple[dict[str, Any], dict[str, Any]]:
+async def plan_with_gemini(prompt: str, model: Optional[str] = None) -> tuple[dict[str, Any], dict[str, Any]]:
     """Plan a video with the free-tier Gemini generateContent API."""
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY is not set")
+    model = (model or GEMINI_TEXT_MODEL or "gemini-3.8-flash").removeprefix("models/").strip()
     body = {
         "systemInstruction": {
             "parts": [
@@ -356,10 +385,11 @@ async def plan_with_gemini(prompt: str) -> tuple[dict[str, Any], dict[str, Any]]
         "generationConfig": {
             "temperature": 0.6,
             "responseMimeType": "application/json",
+            "maxOutputTokens": 8192,
         },
     }
-    url = GEMINI_GENERATE_URL.format(model=GEMINI_TEXT_MODEL)
-    async with httpx.AsyncClient(timeout=90.0) as client:
+    url = GEMINI_GENERATE_URL.format(model=model)
+    async with httpx.AsyncClient(timeout=180.0) as client:
         resp = await client.post(
             url,
             headers={
@@ -381,13 +411,13 @@ async def plan_with_gemini(prompt: str) -> tuple[dict[str, Any], dict[str, Any]]
         tokens_in=tokens_in,
         tokens_out=tokens_out,
         provider="gemini",
-        model=GEMINI_TEXT_MODEL,
+        model=model,
         cost_usd=0.0,  # free-tier planning is logged as INR 0
     )
     plan = _extract_json(content)
     meta = {
         "provider": "gemini",
-        "model": GEMINI_TEXT_MODEL,
+        "model": model,
         "tokens_in": tokens_in,
         "tokens_out": tokens_out,
         "cost_inr": rec.get("cost_inr", 0) or 0,
@@ -441,6 +471,248 @@ class ChatGPTAuthRequired(RuntimeError):
     pass
 
 
+
+GEMINI_TEXT_MODELS = (
+    "gemini-3.8-flash",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-3.5-flash-lite",
+)
+
+
+def _gemini_text_models() -> list[str]:
+    primary = (GEMINI_TEXT_MODEL or "").removeprefix("models/").strip()
+    out: list[str] = []
+    for m in (primary, *GEMINI_TEXT_MODELS):
+        m = (m or "").removeprefix("models/").strip()
+        if m and m not in out:
+            out.append(m)
+    return out
+
+
+def _transient_plan_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(s in msg for s in ("429", "500", "502", "503", "504", "resource_exhausted", "unavailable", "timeout", "timed out"))
+
+
+async def _generate_raw(
+    prompt: str,
+    *,
+    log: Optional[LogFn],
+    emit,
+    prefer_gemini: bool,
+    errors: list[str],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Gemini (trying several models, with backoff) then DeepSeek."""
+    last: Optional[Exception] = None
+    if prefer_gemini:
+        for model in _gemini_text_models():
+            for attempt in range(3):
+                try:
+                    await emit("Planner", f"Gemini free API se plan ({model})")
+                    raw, meta = await plan_with_gemini(prompt, model=model)
+                    return raw, meta
+                except Exception as exc:
+                    last = exc
+                    logger.warning("Gemini planning %s attempt %s failed: %s", model, attempt + 1, exc)
+                    if _transient_plan_error(exc) and attempt < 2:
+                        wait = min(45, 4 * (2 ** attempt))
+                        await emit("Planner", f"Gemini {model} {exc.__class__.__name__}; {wait}s baad retry")
+                        await asyncio.sleep(wait)
+                        continue
+                    errors.append(f"gemini:{model}: {exc}")
+                    break
+        await emit("Planner", f"Gemini fail; DeepSeek try kar raha hoon")
+
+    if DEEPSEEK_API_KEY:
+        try:
+            await emit("Planner", "DeepSeek text API se plan")
+            raw, meta = await plan_with_deepseek(prompt)
+            return raw, meta
+        except Exception as exc:
+            last = exc
+            errors.append(f"deepseek: {exc}")
+            logger.warning("DeepSeek planning failed: %s", exc)
+    raise RuntimeError(f"no planner available: {'; '.join(errors) or last}")
+
+
+async def _plan_long(
+    topic: str,
+    idea: str,
+    channel: Optional[dict[str, Any]],
+    target,
+    *,
+    log,
+    emit,
+    prefer_gemini: bool,
+    errors: list[str],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    from duration_target import word_count, chapter_word_share, chapter_scene_share, estimate_production
+    from longform import (
+        extract_chapter_headings,
+        merge_chapter_plans,
+        outline_prompt,
+        chapter_prompt,
+        expansion_prompt,
+        plan_is_short,
+    )
+
+    est = estimate_production(target)
+    await emit(
+        "Planner",
+        f"Lambi video: {target.minutes:g} min, {target.word_min}–{target.word_max} words, "
+        f"{target.chapters} chapters, ~{target.scene_count} scenes. "
+        f"Estimate ~{est['plan_calls']} plan calls, ~{est['tts_chunks']} TTS chunks. "
+        + (est.get("free_tier_note") or ""),
+    )
+
+    blob = f"{topic or ''}\n{idea or ''}"
+    chapters = extract_chapter_headings(blob)
+    if chapters:
+        # Honor the requested chapter count, but don't drop user headings.
+        if target.chapters and len(chapters) > target.chapters:
+            chapters = chapters[: target.chapters]
+        await emit("Planner", f"Brief se {len(chapters)} chapters mile")
+    else:
+        try:
+            raw, meta = await _generate_raw(
+                outline_prompt(topic, idea, channel, target),
+                log=log, emit=emit, prefer_gemini=prefer_gemini, errors=errors,
+            )
+        except Exception as exc:
+            logger.warning("outline failed: %s", exc)
+            raw, meta = {}, {}
+        found = raw.get("chapters") if isinstance(raw, dict) else None
+        chapters = []
+        if isinstance(found, list):
+            for i, c in enumerate(found, 1):
+                if isinstance(c, dict):
+                    chapters.append({
+                        "id": int(c.get("id") or i),
+                        "title": str(c.get("title") or f"Chapter {i}"),
+                        "brief": str(c.get("beats") or c.get("brief") or ""),
+                    })
+                elif isinstance(c, str):
+                    chapters.append({"id": i, "title": c, "brief": ""})
+        if len(chapters) < max(2, min(target.chapters, 3)):
+            chapters = [{"id": i, "title": f"Chapter {i}", "brief": ""} for i in range(1, target.chapters + 1)]
+        if raw.get("title"):
+            # Keep for merge as a seed part
+            pass
+
+    chapter_count = max(1, len(chapters) or target.chapters)
+    parts: list[dict[str, Any]] = []
+    metas: list[dict[str, Any]] = []
+    words_so_far = 0
+    previous_ending = ""
+    title_seed = ""
+    hook_seed = ""
+
+    for i, ch in enumerate(chapters):
+        prompt = chapter_prompt(
+            topic, idea, channel, target,
+            chapter=ch,
+            chapter_index=i,
+            chapter_count=chapter_count,
+            previous_ending=previous_ending,
+            words_so_far=words_so_far,
+        )
+        wlo, _whi = chapter_word_share(target, i, chapter_count)
+        nscenes = chapter_scene_share(target, chapter_count)
+        raw = {}
+        meta: dict[str, Any] = {}
+        for attempt in range(2):
+            try:
+                raw, meta = await _generate_raw(
+                    prompt, log=log, emit=emit, prefer_gemini=prefer_gemini, errors=errors,
+                )
+            except Exception as exc:
+                logger.warning("chapter %s failed: %s", i + 1, exc)
+                await emit("Planner", f"Chapter {i + 1} fail: {exc}")
+                raw = {}
+                meta = {"error": str(exc)}
+            if raw and not plan_is_short(raw, wlo, nscenes):
+                break
+            if attempt == 0 and raw:
+                await emit(
+                    "Planner",
+                    f"Chapter {i + 1} bahut chhoti hai "
+                    f"({word_count(str(raw.get('voiceover_script') or raw.get('story') or ''))} words); "
+                    "dobara likh raha hoon",
+                )
+                prompt += (
+                    f"\n\nCRITICAL: Your last reply was too short. "
+                    f"Write at least {wlo} words and about {nscenes} scenes. Do not summarize."
+                )
+        if not raw:
+            continue
+        if raw.get("title") and not title_seed:
+            title_seed = raw["title"]
+        if raw.get("hook") and not hook_seed:
+            hook_seed = raw["hook"]
+        parts.append(raw)
+        metas.append(meta)
+        vo = str(raw.get("voiceover_script") or raw.get("story") or "")
+        wc = word_count(vo)
+        words_so_far += wc
+        previous_ending = vo[-800:] if vo else previous_ending
+        nsc = len(raw.get("scenes") or [])
+        await emit(
+            "Planner",
+            f"Chapter {i + 1}/{chapter_count} '{ch.get('title') or ''}': "
+            f"{wc} words, {nsc} scenes (total {words_so_far} words)",
+        )
+        if words_so_far >= target.word_max and i >= chapter_count - 1:
+            break
+
+    if words_so_far < int(target.word_min * 0.75) and parts:
+        need = target.word_min - words_so_far
+        await emit("Planner", f"Abhi {words_so_far} words hain, target {target.word_min}; {need} aur likh raha hoon")
+        try:
+            raw, meta = await _generate_raw(
+                expansion_prompt(
+                    topic, channel, target,
+                    words_so_far=words_so_far,
+                    last_ending=previous_ending,
+                    missing_chapters=chapters[len(parts):],
+                ),
+                log=log, emit=emit, prefer_gemini=prefer_gemini, errors=errors,
+            )
+            if raw:
+                parts.append(raw)
+                metas.append(meta)
+                words_so_far += word_count(str(raw.get("voiceover_script") or raw.get("story") or ""))
+        except Exception as exc:
+            logger.warning("expansion chapter failed: %s", exc)
+            await emit("Planner", f"Expansion fail: {exc}")
+
+    if not parts:
+        raise RuntimeError("long-form planner produced no chapters")
+
+    plan = merge_chapter_plans(parts, topic, target)
+    if title_seed and not plan.get("title"):
+        plan["title"] = title_seed
+    if hook_seed and not plan.get("hook"):
+        plan["hook"] = hook_seed
+    provider = (metas[-1].get("provider") if metas else "gemini") or "gemini"
+    meta = {
+        "provider": provider,
+        "chapters": len(parts),
+        "word_count": plan.get("word_count"),
+        "scene_count": len(plan.get("scenes") or []),
+        "target": target.as_dict(),
+    }
+    await emit(
+        "Planner",
+        f"Poori kahani mil gayi: {plan.get('title')} — "
+        f"{plan.get('word_count')} words, {len(plan.get('scenes') or [])} scenes, "
+        f"{len(parts)} chapters (target {target.word_min}–{target.word_max} words, "
+        f"{target.minutes:g} min)",
+    )
+    return plan, meta
+
+
 async def plan_story(
     topic: str,
     idea: str = "",
@@ -449,29 +721,54 @@ async def plan_story(
     agent: Any = None,
     log: Optional[LogFn] = None,
     dry_run: Optional[bool] = None,
+    target_minutes: Optional[float] = None,
 ) -> dict[str, Any]:
+    from duration_target import detect_duration_target
+
     topic = (topic or "").strip() or "Nayi video"
     use_dry = DRY_RUN if dry_run is None else dry_run
-    prompt = build_prompt(topic, idea, channel)
+    target = detect_duration_target(topic, idea, target_minutes)
+    prompt = build_prompt(topic, idea, channel, target=target)
 
     async def _emit(title: str, message: str) -> None:
         logger.info("%s: %s", title, message)
         if log:
             await log({"type": "action", "title": title, "message": message})
 
+    await _emit(
+        "Planner",
+        f"Target {target.minutes:g} min ({target.source}), "
+        f"{target.word_min}–{target.word_max} words, "
+        f"{target.scene_count} scenes × {target.scene_sec}s"
+        + (f" — {'; '.join(target.notes)}" if target.notes else ""),
+    )
+
     if use_dry:
         await _emit("Planner", "DRY_RUN mock plan")
+        if target.is_long or (target.source in {"explicit", "prompt"} and target.minutes >= 3):
+            from longform import mock_plan_for_target
+            plan = mock_plan_for_target(topic, channel, target)
+        else:
+            plan = mock_plan(topic, channel)
         return {
             "status": "ok",
             "planner": "mock",
-            "plan": mock_plan(topic, channel),
+            "plan": plan,
             "note": "DRY_RUN",
+            "target": target.as_dict(),
         }
 
     errors: list[str] = []
     # Explicit PLANNER=gemini or PLANNER=deepseek skips earlier providers.
     # Default / PLANNER=chatgpt: ChatGPT web -> Gemini (free) -> DeepSeek.
-    prefer_chatgpt = FEATURE_CHATGPT_PLANNER and PLANNER not in {"deepseek", "gemini"}
+    # Long-form skips ChatGPT web: one 30-minute brief will not fit a single
+    # paste, and we need many structured chapter calls.
+    prefer_chatgpt = (
+        FEATURE_CHATGPT_PLANNER
+        and PLANNER not in {"deepseek", "gemini"}
+        and not target.is_long
+        and target.minutes < 3
+    )
     prefer_gemini = bool(GEMINI_API_KEY) and PLANNER != "deepseek"
 
     if prefer_chatgpt and agent is not None:
@@ -480,7 +777,7 @@ async def plan_story(
             raw, meta = await plan_with_chatgpt_web(prompt, agent=agent, log=log)
             plan = normalize_plan(raw, topic)
             await _emit("Planner", f"ChatGPT se plan mil gaya: {plan.get('title')}")
-            return {"status": "ok", "planner": "chatgpt", "plan": plan, "meta": meta}
+            return {"status": "ok", "planner": "chatgpt", "plan": plan, "meta": meta, "target": target.as_dict()}
         except ChatGPTAuthRequired as exc:
             errors.append(f"chatgpt_auth: {exc}")
             await _emit("Planner", "ChatGPT login nahi mila — Gemini fallback")
@@ -489,49 +786,71 @@ async def plan_story(
             logger.warning("ChatGPT planning failed: %s", exc)
             await _emit("Planner", f"ChatGPT fail ({exc}); Gemini try kar raha hoon")
 
-    if prefer_gemini:
+    if target.is_long or (target.source in {"explicit", "prompt"} and target.minutes >= 3):
         try:
-            await _emit("Planner", f"Gemini free API se plan ({GEMINI_TEXT_MODEL})")
-            raw, meta = await plan_with_gemini(prompt)
-            plan = normalize_plan(raw, topic)
-            await _emit("Planner", f"Gemini se plan mil gaya: {plan.get('title')}")
-            status = "fallback" if errors else "ok"
+            plan, meta = await _plan_long(
+                topic, idea, channel, target,
+                log=log, emit=_emit, prefer_gemini=prefer_gemini, errors=errors,
+            )
+            status = "fallback" if any("gemini" in e for e in errors) and meta.get("provider") != "gemini" else "ok"
             return {
                 "status": status,
-                "planner": "gemini",
+                "planner": meta.get("provider") or "gemini",
                 "plan": plan,
                 "meta": meta,
                 "note": "; ".join(errors) if errors else "",
+                "target": target.as_dict(),
             }
         except Exception as exc:
-            errors.append(f"gemini: {exc}")
-            logger.warning("Gemini planning failed: %s", exc)
-            await _emit("Planner", f"Gemini fail ({exc}); DeepSeek try kar raha hoon")
+            errors.append(f"longform: {exc}")
+            logger.warning("Long-form planning failed: %s", exc)
+            await _emit("Planner", f"Long-form fail ({exc}); ek hi call try kar raha hoon")
 
-    if DEEPSEEK_API_KEY:
-        try:
-            await _emit("Planner", "DeepSeek text API se plan")
-            raw, meta = await plan_with_deepseek(prompt)
-            plan = normalize_plan(raw, topic)
-            await _emit("Planner", f"DeepSeek se plan mil gaya: {plan.get('title')}")
-            status = "fallback" if errors else "ok"
-            return {
-                "status": status,
-                "planner": "deepseek",
-                "plan": plan,
-                "meta": meta,
-                "note": "; ".join(errors) if errors else "",
-            }
-        except Exception as exc:
-            errors.append(f"deepseek: {exc}")
-            logger.warning("DeepSeek planning failed: %s", exc)
+    # Short-form (or long-form fallback): a single planner call, with a hint
+    # that already carries the requested duration.
+    try:
+        raw, meta = await _generate_raw(
+            prompt, log=log, emit=_emit, prefer_gemini=prefer_gemini, errors=errors,
+        )
+        plan = normalize_plan(raw, topic)
+        # If the model still returned a tiny plan for a long request, say so.
+        from duration_target import word_count as _wc
+        wc = _wc(plan.get("voiceover_script") or "")
+        nsc = len(plan.get("scenes") or [])
+        note = "; ".join(errors) if errors else ""
+        if target.minutes >= 3 and (wc < target.word_min * 0.4 or nsc < max(3, target.scene_count * 0.3)):
+            note = (note + "; ").lstrip("; ") + (
+                f"plan short: {wc} words, {nsc} scenes "
+                f"(wanted {target.word_min} words, {target.scene_count} scenes)"
+            )
+            await _emit("Planner", note)
+        else:
+            await _emit("Planner", f"{meta.get('provider')} se plan mil gaya: {plan.get('title')}")
+        status = "fallback" if errors else "ok"
+        return {
+            "status": status,
+            "planner": meta.get("provider") or "gemini",
+            "plan": plan,
+            "meta": meta,
+            "note": note,
+            "target": target.as_dict(),
+        }
+    except Exception as exc:
+        errors.append(str(exc))
+        logger.warning("Planning failed: %s", exc)
 
     # Last resort so the pipeline can still produce a draft video offline.
     await _emit("Planner", "API nahi chali, local draft plan use kar raha hoon")
-    plan = themed_fallback_plan(topic, channel) or mock_plan(topic, channel)
+    if target.is_long:
+        from longform import mock_plan_for_target
+        plan = mock_plan_for_target(topic, channel, target)
+    else:
+        plan = themed_fallback_plan(topic, channel) or mock_plan(topic, channel)
     return {
         "status": "fallback",
         "planner": "fallback",
         "plan": plan,
         "note": "; ".join(errors) or "no planner available",
+        "target": target.as_dict(),
     }
+

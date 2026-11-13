@@ -158,7 +158,7 @@ FEATURE_AISTUDIO_VOICE = _bool("FEATURE_AISTUDIO_VOICE", False)
 # Caps for the (optional) browser-clip visuals step. Image scenes use MAX_IMAGE_SCENES.
 MAX_CLIPS_PER_JOB = int(os.getenv("MAX_CLIPS_PER_JOB", "4"))
 CLIP_TIMEOUT_SEC = int(os.getenv("CLIP_TIMEOUT_SEC", "240"))
-MAX_IMAGE_SCENES = int(os.getenv("MAX_IMAGE_SCENES", "10"))
+MAX_IMAGE_SCENES = int(os.getenv("MAX_IMAGE_SCENES", "120"))
 POLLINATIONS_MODEL = os.getenv("POLLINATIONS_MODEL", "flux").strip() or "flux"
 
 # Windows desktop helper (Phase 1, optional). WSL2 localhost forwarding reaches

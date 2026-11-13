@@ -59,6 +59,7 @@ export const HomeScreen: React.FC = () => {
     trackedJobs,
   } = useApp();
   const [topic, setTopic] = useState('');
+  const [targetMinutes, setTargetMinutes] = useState<number | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pendingTopic, setPendingTopic] = useState<string | null>(null);
@@ -111,7 +112,7 @@ export const HomeScreen: React.FC = () => {
     setError(null);
     setPendingTopic(trimmed);
     try {
-      await createVideoJob(trimmed);
+      await createVideoJob(trimmed, '', targetMinutes);
       setTopic('');
     } catch (err) {
       setError(friendlyError(err, activeId, config.backendUrl));
@@ -255,6 +256,32 @@ export const HomeScreen: React.FC = () => {
           />
         </label>
         <p className="text-[11px] text-slate-500 -mt-1.5">Enter = start · Shift+Enter = nayi line</p>
+        <div className="space-y-1.5">
+          <span className="text-[11px] font-medium text-slate-400">Video ki lambai</span>
+          <div className="flex flex-wrap gap-1.5">
+            {([null, 1, 5, 10, 20, 30] as Array<number | null>).map((m) => {
+              const on = targetMinutes === m || (m === null && targetMinutes === null);
+              const label = m === null ? 'Auto' : `${m} min`;
+              return (
+                <button
+                  key={label}
+                  type="button"
+                  onClick={() => setTargetMinutes(m)}
+                  className={`px-2.5 py-1.5 rounded-xl text-[12px] font-medium cursor-pointer min-h-[36px] transition-all duration-150 ${
+                    on
+                      ? 'bg-cyan-500/20 text-cyan-200 border border-cyan-400/40'
+                      : 'bg-slate-950/60 text-slate-300 border border-white/8 hover:border-cyan-500/30 hover:text-white'
+                  }`}
+                >
+                  {label}
+                </button>
+              );
+            })}
+          </div>
+          <p className="text-[10px] text-slate-500">
+            Auto = prompt se andaza (jaise &quot;30 minutes&quot;). Warna itni lambi video banegi.
+          </p>
+        </div>
         <div className="grid grid-cols-2 gap-1.5">
           {TOPIC_CHIPS.map((chip) => {
             const Icon = chip.Icon;

@@ -223,19 +223,9 @@ class VoiceResult:
     note: str = ""
 
 
-def _style_prompt(sentence: str, lang: str) -> str:
-    lang_l = (lang or "Hindi").lower()
-    spoken = "Hindi" if lang_l.startswith("hi") else ("English" if lang_l.startswith("en") else lang)
-    return (
-        "Narrate the text between the <narration> tags and nothing else. "
-        f"Language: {spoken}. "
-        "Style: a deep, male, suspenseful horror storyteller. "
-        "Speak slowly and clearly, with a short dramatic pause, "
-        "in a quiet whisper-like intensity, taking about eight to ten seconds. "
-        "Do not stretch individual words, do not translate, do not add words, "
-        "do not introduce yourself.\n"
-        f"<narration>\n{sentence.strip()}\n</narration>"
-    )
+def _style_prompt(sentence: str, lang: str, seconds_hint: float | None = None) -> str:
+    from gemini_tts import storyteller_prompt
+    return storyteller_prompt(sentence, lang, seconds_hint=seconds_hint)
 
 
 def _gemini_models() -> list[str]:
@@ -258,6 +248,7 @@ def _gemini_voices() -> list[str]:
     return out
 
 
+
 async def _gemini_tts_one(
     text: str,
     dest: Path,
@@ -265,67 +256,46 @@ async def _gemini_tts_one(
     lang: str,
     model: str,
     voice: str,
+    seconds_hint: float | None = None,
+    prefer_rest: bool = False,
 ) -> Path:
-    from google import genai
-    from google.genai import types
+    from gemini_tts import gemini_tts_one, classify_gemini_error
 
     from config import GEMINI_API_KEY
 
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY is not set")
 
-    client = genai.Client(api_key=GEMINI_API_KEY)
-    speech_kwargs: dict[str, Any] = {
-        "voice_config": types.VoiceConfig(
-            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice)
+    try:
+        data, mime, used = await gemini_tts_one(
+            text,
+            lang=lang,
+            model=model,
+            voice=voice,
+            api_key=GEMINI_API_KEY,
+            seconds_hint=seconds_hint,
+            prefer_rest=prefer_rest,
         )
-    }
-    # language_code is supported on some SDK versions only.
-    try:
-        speech = types.SpeechConfig(**speech_kwargs, language_code="hi-IN" if (lang or "").lower().startswith("hi") else "en-US")
-    except (TypeError, ValueError):
-        speech = types.SpeechConfig(**speech_kwargs)
-
-    response = await client.aio.models.generate_content(
-        model=model,
-        contents=_style_prompt(text, lang),
-        config=types.GenerateContentConfig(
-            response_modalities=["AUDIO"],
-            speech_config=speech,
-        ),
-    )
-    data = b""
-    mime = ""
-    try:
-        parts = response.candidates[0].content.parts
     except Exception as exc:
-        raise RuntimeError(f"Gemini TTS returned no audio: {exc}") from exc
-    for part in parts or []:
-        inline = getattr(part, "inline_data", None) or getattr(part, "inlineData", None)
-        if inline is None:
-            continue
-        data = _decode_inline(getattr(inline, "data", None))
-        mime = str(getattr(inline, "mime_type", None) or getattr(inline, "mimeType", None) or "")
-        if data:
-            break
-    if not data:
-        raise RuntimeError("Gemini TTS returned empty audio")
+        # Re-raise classified quota errors; wrap the rest.
+        from gemini_tts import GeminiTTSError
+        if isinstance(exc, GeminiTTSError):
+            raise
+        raise classify_gemini_error(exc) from exc
 
     dest = dest.with_suffix(".wav")
     wrap_pcm_to_wav(data, dest, rate=PCM_RATE, mime=mime)
+    logger.info("Gemini TTS %s/%s via %s -> %s (%s bytes)", model, voice, used, dest.name, dest.stat().st_size)
 
     try:
         from db import record_usage
 
-        usage = getattr(response, "usage_metadata", None) or getattr(response, "usageMetadata", None)
-        tokens_in = int(getattr(usage, "prompt_token_count", 0) or getattr(usage, "promptTokenCount", 0) or 0) if usage else 0
-        tokens_out = int(getattr(usage, "candidates_token_count", 0) or getattr(usage, "candidatesTokenCount", 0) or 0) if usage else 0
         record_usage(
             task_type="tts",
             status="ok",
-            details=f"{model}/{voice}",
-            tokens_in=tokens_in,
-            tokens_out=tokens_out,
+            details=f"{model}/{voice}/{used}",
+            tokens_in=0,
+            tokens_out=0,
             provider="gemini",
             model=model,
             kind="tts",
@@ -582,6 +552,11 @@ def normalize_segments(
             out.append({"text": s, "min_sec": 0.0})
     if not out and (script or "").strip():
         out.append({"text": script.strip(), "min_sec": 0.0})
+    try:
+        from gemini_tts import expand_segments
+        out = expand_segments(out)
+    except Exception:
+        pass
     return out
 
 
@@ -639,41 +614,248 @@ async def _synth_segments(
     return master, cues, dur
 
 
+
 async def _try_gemini(
     segments: list[dict[str, Any]],
     work: Path,
     lang: str,
     log: Optional[LogFn],
 ) -> tuple[Path, list[dict[str, Any]], float, str]:
+    """All-Gemini path (kept for tests). Prefer _synth_cascaded for jobs."""
     last_err: Optional[Exception] = None
-    for model in _gemini_models():
-        for voice in _gemini_voices():
-            async def _one(text: str, dest: Path, *, lang: str, _m=model, _v=voice) -> Path:
-                # Retry a single segment once on transient failure.
-                err: Optional[Exception] = None
-                for attempt in range(2):
-                    try:
-                        return await _gemini_tts_one(text, dest, lang=lang, model=_m, voice=_v)
-                    except Exception as exc:
-                        err = exc
-                        logger.warning("Gemini TTS %s/%s attempt %s failed: %s", _m, _v, attempt + 1, exc)
-                        await asyncio.sleep(0.8 * (attempt + 1))
-                raise err or RuntimeError("Gemini TTS failed")
+    from gemini_tts import GeminiTTSError, backoff_seconds, classify_gemini_error
 
-            try:
-                await _emit(log, "action", "Gemini TTS", f"{model} voice={voice}")
-                # Fresh work dir per attempt so leftovers don't mix.
-                attempt_dir = work / f"gemini_{model}_{voice}"
-                wav, cues, dur = await _synth_segments(
-                    segments, attempt_dir, _one, label=f"Gemini {voice}", lang=lang, log=log
-                )
-                return wav, cues, dur, f"gemini:{model}:{voice}"
-            except Exception as exc:
-                last_err = exc
-                logger.warning("Gemini TTS %s/%s failed: %s", model, voice, exc)
-                await _emit(log, "system", "TTS fallback", f"Gemini {model}/{voice} fail: {exc}")
-                continue
+    models = _gemini_models()
+    voices = _gemini_voices()
+    # Lock onto Charon (or the configured primary) and the first model;
+    # only switch model if the primary is missing, not because of a single 429.
+    for model in models:
+        voice = voices[0] if voices else "Charon"
+
+        async def _one(text: str, dest: Path, *, lang: str, _m=model, _v=voice) -> Path:
+            err: Optional[Exception] = None
+            for attempt in range(4):
+                try:
+                    return await _gemini_tts_one(text, dest, lang=lang, model=_m, voice=_v)
+                except Exception as exc:
+                    classified = exc if isinstance(exc, GeminiTTSError) else classify_gemini_error(exc)
+                    err = classified
+                    if classified.daily:
+                        raise classified
+                    wait = backoff_seconds(attempt, retry_delay=classified.retry_delay)
+                    logger.warning(
+                        "Gemini TTS %s/%s attempt %s failed: %s; sleep %.1fs",
+                        _m, _v, attempt + 1, classified, wait,
+                    )
+                    if classified.rate_limit or classified.status in {429, 503, 502, 500, 504}:
+                        await asyncio.sleep(wait)
+                        continue
+                    raise classified
+            raise err or RuntimeError("Gemini TTS failed")
+
+        try:
+            await _emit(log, "action", "Gemini TTS", f"{model} voice={voice}")
+            attempt_dir = work / f"gemini_{model}_{voice}"
+            wav, cues, dur = await _synth_segments(
+                segments, attempt_dir, _one, label=f"Gemini {voice}", lang=lang, log=log
+            )
+            return wav, cues, dur, f"gemini:{model}:{voice}"
+        except GeminiTTSError as exc:
+            last_err = exc
+            if exc.daily:
+                await _emit(log, "system", "TTS quota", exc.friendly())
+                raise
+            logger.warning("Gemini TTS %s/%s failed: %s", model, voice, exc)
+            await _emit(log, "system", "TTS fallback", f"Gemini {model}/{voice} fail: {exc}")
+            continue
+        except Exception as exc:
+            last_err = exc
+            logger.warning("Gemini TTS %s/%s failed: %s", model, voice, exc)
+            await _emit(log, "system", "TTS fallback", f"Gemini {model}/{voice} fail: {exc}")
+            continue
     raise RuntimeError(f"Gemini TTS failed: {last_err}")
+
+
+async def _pad_segment(
+    produced: Path,
+    work: Path,
+    i: int,
+    min_sec: float,
+    *,
+    last: bool,
+    default_pause: float = DEFAULT_PAUSE_SEC,
+) -> tuple[Path, float, float]:
+    """Return (padded_wav, spoken_sec, total_with_pad)."""
+    produced = await _to_wav(Path(produced), work / f"s{i:02d}.wav")
+    spoken = await media_duration(produced)
+    if spoken <= 0.05:
+        raise RuntimeError(f"TTS segment {i + 1} was empty")
+    pad = (min_sec - spoken) if min_sec and spoken < min_sec else 0.0
+    pause = 0.0 if pad >= default_pause else (default_pause if not last else min(0.3, default_pause))
+    extra = pad + pause
+    if extra >= 0.05:
+        sil = work / f"sil{i:02d}.wav"
+        await _write_silence_wav(sil, extra)
+        padded = work / f"p{i:02d}.wav"
+        await _concat_wavs([produced, sil], padded)
+        return padded, spoken, spoken + extra
+    return produced, spoken, spoken + extra
+
+
+async def _fallback_one(text: str, dest: Path, *, lang: str) -> tuple[Path, str]:
+    try:
+        path = await _edge_tts_one(text, dest, lang=lang)
+        return path, "edge-tts"
+    except Exception as edge_exc:
+        logger.warning("edge-tts chunk failed: %s", edge_exc)
+        path = await _gtts_one(text, dest, lang=lang)
+        return path, "gtts"
+
+
+async def _synth_cascaded(
+    segments: list[dict[str, Any]],
+    work: Path,
+    lang: str,
+    log: Optional[LogFn],
+    *,
+    use_gemini: bool,
+) -> tuple[Path, list[dict[str, Any]], float, str, str]:
+    """Synthesize each chunk with Gemini (Charon), falling back per chunk.
+
+    Returns (wav, cues, duration, engine_id, note). engine_id is like
+    'gemini:gemini-3.8-flash-tts:Charon', 'edge-tts', 'gtts', or
+    'mixed:gemini=10,edge-tts=2'. Daily quota is reported in `note` and
+    logged instead of being silent.
+    """
+    from gemini_tts import GeminiTTSError, backoff_seconds, classify_gemini_error
+
+    work = Path(work)
+    work.mkdir(parents=True, exist_ok=True)
+    wavs: list[Path] = []
+    cues: list[dict[str, Any]] = []
+    used: list[str] = []
+    t = 0.0
+    note_parts: list[str] = []
+    daily = False
+    locked_model = (_gemini_models() or ["gemini-3.8-flash-tts"])[0]
+    locked_voice = (_gemini_voices() or ["Charon"])[0]
+    models = _gemini_models()
+    gemini_enabled = bool(use_gemini)
+
+    await _emit(
+        log, "action", "Voiceover",
+        f"TTS {len(segments)} chunks; primary=gemini:{locked_model}:{locked_voice}"
+        if gemini_enabled else f"TTS {len(segments)} chunks; Gemini off",
+    )
+
+    for i, seg in enumerate(segments):
+        text = seg["text"]
+        min_sec = float(seg.get("min_sec") or 0)
+        part = work / f"raw{i:02d}.wav"
+        engine = ""
+        produced: Optional[Path] = None
+
+        if gemini_enabled and not daily:
+            last_err: Optional[Exception] = None
+            # Stay on the locked model+voice for consistency. If the model is
+            # unavailable (404), try the next one only before the first success.
+            try_models = [locked_model] if any(u.startswith("gemini:") for u in used) else list(models)
+            for model in try_models:
+                for attempt in range(4):
+                    try:
+                        produced = await _gemini_tts_one(
+                            text, part, lang=lang, model=model, voice=locked_voice,
+                            seconds_hint=min_sec or None,
+                        )
+                        engine = f"gemini:{model}:{locked_voice}"
+                        locked_model = model
+                        last_err = None
+                        break
+                    except Exception as exc:
+                        classified = exc if isinstance(exc, GeminiTTSError) else classify_gemini_error(exc)
+                        last_err = classified
+                        if classified.daily:
+                            daily = True
+                            msg = classified.friendly()
+                            note_parts.append(msg)
+                            logger.warning("Gemini daily quota: %s", classified)
+                            await _emit(log, "system", "TTS quota", msg)
+                            break
+                        wait = backoff_seconds(attempt, retry_delay=classified.retry_delay)
+                        logger.warning(
+                            "Gemini TTS %s/%s chunk %s attempt %s failed: %s; sleep %.1fs",
+                            model, locked_voice, i + 1, attempt + 1, classified, wait,
+                        )
+                        await _emit(
+                            log, "system", "TTS retry",
+                            f"voice: gemini {classified.status or ''} chunk {i + 1}/{len(segments)} "
+                            f"attempt {attempt + 1}, wait {wait:.0f}s",
+                        )
+                        if classified.rate_limit or classified.status in {429, 500, 502, 503, 504}:
+                            await asyncio.sleep(wait)
+                            continue
+                        # Non-retryable (400 after REST, etc.) — leave this chunk.
+                        break
+                if produced is not None or daily:
+                    break
+
+        if produced is None:
+            fb_dest = work / f"fb{i:02d}.wav"
+            try:
+                produced, engine = await _fallback_one(text, fb_dest, lang=lang)
+                if daily:
+                    pass
+                else:
+                    await _emit(
+                        log, "system", "TTS fallback",
+                        f"voice: {engine} chunk {i + 1}/{len(segments)} "
+                        f"(Gemini fail on this chunk only)",
+                    )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"all TTS engines failed on chunk {i + 1}/{len(segments)}: {exc}"
+                ) from exc
+
+        used.append(engine)
+        await _emit(
+            log, "action", "TTS",
+            f"voice: {engine} chunk {i + 1}/{len(segments)}",
+        )
+        padded, spoken, total = await _pad_segment(
+            produced, work, i, min_sec, last=(i == len(segments) - 1)
+        )
+        wavs.append(padded)
+        cues.append({"start": round(t, 3), "end": round(t + spoken, 3), "text": text, "engine": engine})
+        t = t + total
+
+    master = work / "master.wav"
+    await _concat_wavs(wavs, master)
+    dur = await media_duration(master) or t
+
+    counts: dict[str, int] = {}
+    for e in used:
+        key = e.split(":")[0] if e.startswith("gemini:") else e
+        counts[key] = counts.get(key, 0) + 1
+    gemini_n = sum(1 for e in used if e.startswith("gemini:"))
+    if gemini_n == len(used) and used:
+        engine_id = used[0]
+    elif gemini_n == 0:
+        # Prefer the majority fallback name.
+        engine_id = max(counts, key=counts.get) if counts else "edge-tts"
+        if daily:
+            engine_id = f"{engine_id} (gemini daily quota exhausted)"
+    else:
+        parts = [f"{k}={v}" for k, v in counts.items()]
+        engine_id = "mixed:" + ",".join(parts)
+        if daily:
+            engine_id += " (gemini daily quota exhausted)"
+
+    note = " | ".join(note_parts)
+    summary = f"voice: {engine_id} {dur:.1f}s, {len(cues)} cues"
+    if note:
+        summary += " — " + note
+    await _emit(log, "system", "Voiceover", summary)
+    return master, cues, dur, engine_id, note
 
 
 async def _try_edge(
@@ -734,7 +916,6 @@ async def synthesize_voice_full(
 
     work = dest.parent / f".voice_{dest.stem}"
     work.mkdir(parents=True, exist_ok=True)
-    errors: list[str] = []
 
     use_gemini = _cfg_bool("USE_GEMINI_TTS", True)
     gemini_key = _cfg("GEMINI_API_KEY")
@@ -745,42 +926,27 @@ async def synthesize_voice_full(
     except Exception:
         pass
 
-    engines = []
-    if use_gemini and gemini_key:
-        engines.append(("gemini", _try_gemini))
-    engines.append(("edge-tts", _try_edge))
-    engines.append(("gtts", _try_gtts))
-
-    last: Optional[Exception] = None
     try:
-        for name, fn in engines:
+        wav, cues, dur, engine, note = await _synth_cascaded(
+            segs, work, lang, log, use_gemini=bool(use_gemini and gemini_key),
+        )
+        out = await _encode_dest(wav, dest)
+        save_cues(out, cues)
+        if Path(out) != dest:
             try:
-                wav, cues, dur, engine = await fn(segs, work, lang, log)
-                out = await _encode_dest(wav, dest)
-                save_cues(out, cues)
-                if out != dest and dest.suffix == out.suffix:
-                    pass
-                # If we encoded next to a different path, copy cues under requested dest too.
-                if Path(out) != dest:
-                    try:
-                        if dest.suffix == out.suffix or dest.suffix.lower() in {".mp3", ".wav", ".m4a"}:
-                            # Leave dest pointing at the real file if encode changed suffix.
-                            pass
-                        save_cues(dest, cues)
-                    except Exception:
-                        pass
-                await _emit(log, "system", "Voiceover", f"{engine} {dur:.1f}s, {len(cues)} cues → {Path(out).name}")
-                return VoiceResult(engine=engine, path=Path(out), cues=cues, duration=dur)
-            except Exception as exc:
-                last = exc
-                errors.append(f"{name}: {exc}")
-                logger.warning("voice engine %s failed: %s", name, exc)
-                await _emit(log, "system", "TTS fallback", f"{name} failed ({exc})")
-                continue
-        raise RuntimeError("; ".join(errors) or f"all TTS engines failed: {last}")
+                save_cues(dest, cues)
+            except Exception:
+                pass
+        await _emit(
+            log, "system", "Voiceover",
+            f"{engine} {dur:.1f}s, {len(cues)} cues → {Path(out).name}",
+        )
+        return VoiceResult(engine=engine, path=Path(out), cues=cues, duration=dur, note=note)
+    except Exception as exc:
+        logger.warning("cascaded TTS failed: %s", exc)
+        await _emit(log, "system", "TTS fallback", f"cascaded TTS failed ({exc})")
+        raise
     finally:
-        # Keep work dir on failure for debugging? Clean on success only is nicer.
-        # Always clean to avoid filling /data.
         import shutil
         shutil.rmtree(work, ignore_errors=True)
 

@@ -40,7 +40,7 @@ interface AppContextType {
   removeChannel: (id: string) => Promise<void>;
   jobs: Job[];
   refreshJobs: () => Promise<void>;
-  createVideoJob: (topic: string, idea?: string) => Promise<Job | null>;
+  createVideoJob: (topic: string, idea?: string, targetMinutes?: number | null) => Promise<Job | null>;
   devices: Record<BackendId, DeviceSnapshot>;
   refreshDevices: () => Promise<void>;
   trackedJobs: Partial<Record<BackendId, TrackedJob>>;
@@ -389,7 +389,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     };
   }, [config.backendUrl, config.agentToken, config.demoMode, config.backends, refreshHealth, refreshChannels, refreshJobs, refreshDevices]);
 
-  const createVideoJob = async (topic: string, idea = ''): Promise<Job | null> => {
+  const createVideoJob = async (topic: string, idea = '', targetMinutes: number | null = null): Promise<Job | null> => {
     const trimmed = topic.trim();
     if (!trimmed) return null;
     const cfg = configRef.current;
@@ -412,7 +412,12 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     try {
       const r = await apiFetch<{ job: Job }>(toStored(cfg), '/api/jobs', {
         method: 'POST',
-        body: JSON.stringify({ channel_id: selectedChannelRef.current, topic: trimmed, idea }),
+        body: JSON.stringify({
+          channel_id: selectedChannelRef.current,
+          topic: trimmed,
+          idea,
+          ...(targetMinutes && targetMinutes > 0 ? { target_minutes: targetMinutes } : {}),
+        }),
       });
       const job = r.job;
       addLog({ type: 'system', title: 'Nayi video', message: `${trimmed} · ${label}` });

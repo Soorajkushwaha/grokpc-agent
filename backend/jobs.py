@@ -96,6 +96,9 @@ def init_tables(conn=None) -> None:
     cur.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_job_logs_job ON job_logs(job_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_job_steps_job ON job_steps(job_id)")
+    cols = {row[1] for row in cur.execute("PRAGMA table_info(jobs)")}
+    if "target_minutes" not in cols:
+        cur.execute("ALTER TABLE jobs ADD COLUMN target_minutes REAL")
     conn.commit()
     if own:
         conn.close()
@@ -116,18 +119,27 @@ def create_job(
     idea: str = "",
     autopilot: bool = False,
     steps: Optional[list[str]] = None,
+    target_minutes: Optional[float] = None,
 ) -> dict[str, Any]:
     job_id = _new_id("job")
     steps = list(steps or pipeline_steps())
+    tm: Optional[float] = None
+    if target_minutes is not None:
+        try:
+            tm = float(target_minutes)
+            if tm <= 0:
+                tm = None
+        except (TypeError, ValueError):
+            tm = None
     conn = connect()
     conn.execute(
         """
         INSERT INTO jobs (
             id, channel_id, topic, idea, status, current_step,
-            plan_json, media_json, autopilot, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, 'queued', ?, 'null', '[]', ?, ?, ?)
+            plan_json, media_json, autopilot, created_at, updated_at, target_minutes
+        ) VALUES (?, ?, ?, ?, 'queued', ?, 'null', '[]', ?, ?, ?, ?)
         """,
-        (job_id, channel_id, topic, idea, steps[0] if steps else "story", int(autopilot), _now(), _now()),
+        (job_id, channel_id, topic, idea, steps[0] if steps else "story", int(autopilot), _now(), _now(), tm),
     )
     for i, name in enumerate(steps):
         conn.execute(
@@ -141,6 +153,23 @@ def create_job(
     conn.close()
     append_log(job_id, "system", f"Job created for channel={channel_id} topic={topic!r}", step=steps[0] if steps else "")
     return get_job(job_id)
+
+
+def _target_minutes(row) -> Optional[float]:
+    try:
+        keys = row.keys()
+    except Exception:
+        keys = []
+    if "target_minutes" not in keys:
+        return None
+    val = row["target_minutes"]
+    if val is None or val == "":
+        return None
+    try:
+        f = float(val)
+    except (TypeError, ValueError):
+        return None
+    return f if f > 0 else None
 
 
 def _row_job(row, steps=None, logs=None) -> dict[str, Any]:
@@ -157,6 +186,7 @@ def _row_job(row, steps=None, logs=None) -> dict[str, Any]:
         "channel_id": row["channel_id"],
         "topic": row["topic"],
         "idea": row["idea"] or "",
+        "target_minutes": _target_minutes(row),
         "status": row["status"],
         "current_step": row["current_step"],
         "plan": _json(row["plan_json"], None),
@@ -285,6 +315,7 @@ def update_job(job_id: str, **fields: Any) -> dict[str, Any]:
         "channel_id",
         "topic",
         "idea",
+        "target_minutes",
     }
     sets = []
     args: list[Any] = []

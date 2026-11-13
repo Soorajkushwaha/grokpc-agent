@@ -28,7 +28,7 @@ SAFETY_SUFFIX = (
 )
 DEFAULT_MODEL = "flux"
 FALLBACK_MODEL = "turbo"
-MAX_SCENES = 10
+MAX_SCENES = 120
 MIN_IMAGE_BYTES = 12_000
 
 
@@ -174,6 +174,11 @@ async def fetch_pollinations(
                     headers=headers,
                 ) as client:
                     resp = await client.get(url)
+                if resp.status_code == 402:
+                    # Payment / free-tier gate — retries will not help.
+                    raise RuntimeError(
+                        f"Pollinations failed: Client error '402 Payment Required' for url '{url}'"
+                    )
                 if resp.status_code in {429, 500, 502, 503, 504}:
                     last_err = RuntimeError(f"HTTP {resp.status_code}")
                     await asyncio.sleep(1.5 * (attempt + 1))
@@ -210,22 +215,67 @@ async def generate_pollinations_images(
     paths: list[Path] = []
     notes: list[str] = []
     await _emit(log, "Visuals", f"Pollinations se {len(specs)} scene stills")
-    for spec in specs:
+    results: list[Optional[Path]] = [None] * len(specs)
+    consecutive_402 = 0
+    stop_fetching = False
+    for i, spec in enumerate(specs):
         idx = int(spec["index"])
         seed = _seed_for(job_id or "job", idx)
         dest = dest_dir / f"scene_{idx:02d}.jpg"
+        if stop_fetching:
+            notes.append(f"scene {idx}: skipped (Pollinations 402)")
+            continue
         try:
             path = await fetch_pollinations(
                 spec["prompt"], dest, width=width, height=height, seed=seed
             )
-            paths.append(path)
+            results[i] = path
+            consecutive_402 = 0
             await _emit(log, "Visuals", f"still {idx}: {path.name} ({path.stat().st_size} B)")
         except Exception as exc:
             notes.append(f"scene {idx}: {exc}")
             logger.warning("pollinations scene %s failed: %s", idx, exc)
             await _emit(log, "Visuals", f"still {idx} fail: {exc}")
+            if "402" in str(exc):
+                consecutive_402 += 1
+                if consecutive_402 >= 2:
+                    stop_fetching = True
+                    await _emit(
+                        log, "Visuals",
+                        "Pollinations 402 bar-bar aa raha hai — baaki scenes pe pehli successful image reuse hogi (Ken Burns)",
+                    )
         # Be polite to the free endpoint.
         await asyncio.sleep(0.4)
+
+    # Second pass: fill holes by reusing the nearest successful still so every
+    # scene still has a frame (Ken Burns varies the motion per clip).
+    good = [p for p in results if p is not None]
+    import shutil
+    for i, path in enumerate(results):
+        if path is not None:
+            paths.append(path)
+            continue
+        if not good:
+            continue
+        # Nearest previous, else wrap.
+        src = None
+        for j in range(i, -1, -1):
+            if results[j] is not None:
+                src = results[j]
+                break
+        if src is None:
+            src = good[i % len(good)]
+        idx = int(specs[i]["index"])
+        dest = dest_dir / f"scene_{idx:02d}_reuse{src.suffix}"
+        try:
+            shutil.copyfile(src, dest)
+            paths.append(dest)
+            results[i] = dest
+            notes.append(f"scene {idx}: reused {src.name} (Pollinations failed; Ken Burns)")
+            await _emit(log, "Visuals", f"still {idx}: reused {src.name} for Ken Burns")
+        except Exception as exc:
+            notes.append(f"scene {idx}: reuse failed: {exc}")
+
     if not paths:
         return {
             "status": "skipped",
@@ -233,9 +283,17 @@ async def generate_pollinations_images(
             "provider": "pollinations",
             "note": "; ".join(notes) or "Pollinations returned no images",
         }
-    note = f"{len(paths)}/{len(specs)} stills"
+    unique = len({p.resolve() for p in good}) if good else 0
+    reused = len(paths) - unique
+    note = f"{unique}/{len(specs)} unique stills"
+    if reused > 0:
+        note += f", {reused} reused for Ken Burns"
     if notes:
-        note += " — " + "; ".join(notes)
+        # Keep the note bounded so job step details don't explode.
+        short = "; ".join(notes[:8])
+        if len(notes) > 8:
+            short += f" … +{len(notes) - 8} more"
+        note += " — " + short
     return {
         "status": "ok",
         "paths": paths,

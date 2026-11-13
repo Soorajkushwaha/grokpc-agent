@@ -402,6 +402,7 @@ class JobIn(BaseModel):
     topic: str
     idea: str = ""
     autopilot: bool = False
+    target_minutes: Optional[float] = None
 
 
 @app.get("/api/jobs")
@@ -437,6 +438,7 @@ async def api_create_job(req: JobIn, _auth: str = Depends(require_auth)):
         topic=topic,
         idea=req.idea.strip(),
         autopilot=req.autopilot,
+        target_minutes=req.target_minutes,
     )
     await broadcast(
         {

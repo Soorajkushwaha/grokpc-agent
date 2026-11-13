@@ -109,6 +109,7 @@ export interface Job {
   channel_id: string;
   topic: string;
   idea: string;
+  target_minutes?: number | null;
   status: string;
   current_step: string;
   plan?: {
