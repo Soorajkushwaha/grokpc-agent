@@ -193,3 +193,77 @@ export async function apiFetch<T = unknown>(
   if (res.status === 204) return undefined as T;
   return (await res.json()) as T;
 }
+
+function filenameFromDisposition(header: string | null): string | null {
+  if (!header) return null;
+  const star = /filename\*=(?:UTF-8''|)([^;]+)/i.exec(header);
+  if (star) {
+    try {
+      return decodeURIComponent(star[1].trim().replace(/^"+|"+$/g, ''));
+    } catch {
+      /* ignore */
+    }
+  }
+  const plain = /filename="([^"]+)"|filename=([^;]+)/i.exec(header);
+  if (plain) return (plain[1] || plain[2] || '').trim();
+  return null;
+}
+
+/** Fetch the job's final video from the active worker and trigger a browser download. */
+export async function downloadJobVideo(
+  cfg: StoredConfig,
+  jobId: string,
+  onProgress?: (percent: number | null) => void,
+): Promise<string> {
+  if (cfg.demoMode) {
+    throw new Error('Demo mode me download nahi ho sakta');
+  }
+  if (!isConfigured(cfg)) {
+    throw new Error('Backend URL aur token set nahi hai');
+  }
+  onProgress?.(0);
+  const res = await fetch(joinUrl(cfg.backendUrl, `/api/jobs/${encodeURIComponent(jobId)}/download`), {
+    headers: { Authorization: `Bearer ${cfg.agentToken}` },
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    if (res.status === 404) {
+      throw new Error('Video file nahi mili');
+    }
+    if (res.status === 401) {
+      throw new Error('Token galat hai — Settings me worker URL/token check karo');
+    }
+    throw new Error(`${res.status} ${res.statusText}: ${text.slice(0, 300)}`);
+  }
+  const total = Number(res.headers.get('Content-Length') || 0);
+  let blob: Blob;
+  if (res.body && total > 0) {
+    const reader = res.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let received = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        chunks.push(value);
+        received += value.byteLength;
+        onProgress?.(Math.min(99, Math.round((received / total) * 100)));
+      }
+    }
+    blob = new Blob(chunks, { type: res.headers.get('Content-Type') || 'video/mp4' });
+  } else {
+    onProgress?.(null);
+    blob = await res.blob();
+  }
+  const filename = filenameFromDisposition(res.headers.get('Content-Disposition')) || `GrokPC_${jobId}.mp4`;
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+  onProgress?.(100);
+  return filename;
+}

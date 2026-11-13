@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { useApp } from '../context/AppContext';
+import { downloadJobVideo } from '../api';
 import { STEP_LABELS, type Job, type JobStep } from '../types';
 import {
   Pause,
@@ -18,6 +19,7 @@ import {
   Sparkles,
   Folder,
   AlertCircle,
+  Download,
 } from 'lucide-react';
 import { channelTheme, initials, relativeTime } from '../ui';
 
@@ -115,16 +117,40 @@ function StepBar({ steps }: { steps: JobStep[] }) {
   );
 }
 
-const JobCard: React.FC<{ job: Job }> = ({ job }) => {
-  const { channels, pauseJob, resumeJob, cancelJob, approvePublish, status } = useApp();
+const READY_STATUSES = new Set(['completed', 'success', 'waiting_approval']);
+
+const JobCard: React.FC<{ job: Job; onToast?: (kind: 'ok' | 'error', text: string) => void }> = ({
+  job,
+  onToast,
+}) => {
+  const { channels, pauseJob, resumeJob, cancelJob, approvePublish, status, config } = useApp();
   const [open, setOpen] = useState(false);
+  const [downloading, setDownloading] = useState(false);
+  const [progress, setProgress] = useState<number | null>(null);
   const ch = channels.find((c) => c.id === job.channel_id);
   const canPublish = Boolean(status?.features?.youtube_upload) && job.status === 'waiting_approval';
+  const canDownload = READY_STATUSES.has(job.status) || Boolean(job.final_path || job.video_path);
   const title = job.plan?.title || job.topic;
   const meta = statusMeta(job.status);
   const theme = channelTheme(job.channel_id || '');
   const when = relativeTime(job.updated_at || job.created_at);
   const isRunning = job.status === 'running' || job.status === 'queued';
+
+  const handleDownload = async () => {
+    if (downloading) return;
+    setDownloading(true);
+    setProgress(0);
+    try {
+      const name = await downloadJobVideo(config, job.id, (pct) => setProgress(pct));
+      onToast?.('ok', `${name} download ho gayi`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      onToast?.('error', msg || 'Download fail ho gaya');
+    } finally {
+      setDownloading(false);
+      setProgress(null);
+    }
+  };
 
   return (
     <div className={`card p-4 space-y-3.5 ${isRunning ? 'ring-1 ring-cyan-400/25' : ''}`}>
@@ -162,14 +188,28 @@ const JobCard: React.FC<{ job: Job }> = ({ job }) => {
           {job.error}
         </p>
       )}
-      {job.final_path && job.status === 'completed' && (
+      {(job.final_path || job.video_path) && READY_STATUSES.has(job.status) && (
         <p className="text-[11px] text-slate-400 font-mono truncate flex items-center gap-1.5 bg-slate-950/50 rounded-xl px-2.5 py-2 border border-white/5">
           <Folder className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-          <span className="truncate">{job.final_path}</span>
+          <span className="truncate">{job.final_path || job.video_path}</span>
         </p>
       )}
 
       <div className="flex flex-wrap gap-2">
+        {canDownload && !isRunning && (
+          <button
+            onClick={() => void handleDownload()}
+            disabled={downloading}
+            className="flex items-center gap-1 text-xs px-3 py-2 min-h-[36px] rounded-xl bg-emerald-700 text-white cursor-pointer hover:bg-emerald-600 transition-colors disabled:opacity-60 disabled:cursor-wait"
+          >
+            <Download className="w-3 h-3" />
+            {downloading
+              ? progress == null
+                ? 'Downloading…'
+                : `Downloading… ${progress}%`
+              : '⬇️ PC me download'}
+          </button>
+        )}
         {(job.status === 'running' || job.status === 'queued') && (
           <button
             onClick={() => void pauseJob(job.id)}
@@ -233,6 +273,12 @@ const JobCard: React.FC<{ job: Job }> = ({ job }) => {
 
 export const JobsScreen: React.FC = () => {
   const { jobs, setActiveTab } = useApp();
+  const [toast, setToast] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null);
+
+  const showToast = (kind: 'ok' | 'error', text: string) => {
+    setToast({ kind, text });
+    window.setTimeout(() => setToast((cur) => (cur?.text === text ? null : cur)), 4500);
+  };
   if (!jobs.length) {
     return (
       <div className="flex flex-col items-center justify-center text-center py-16 px-6">
@@ -258,8 +304,20 @@ export const JobsScreen: React.FC = () => {
         <span className="text-[11px] text-slate-500">{jobs.length} {jobs.length === 1 ? "video" : "videos"}</span>
       </div>
       {jobs.map((j) => (
-        <JobCard key={j.id} job={j} />
+        <JobCard key={j.id} job={j} onToast={showToast} />
       ))}
+      {toast && (
+        <div
+          role="status"
+          className={`fixed left-1/2 -translate-x-1/2 bottom-[max(5.5rem,calc(4.25rem+env(safe-area-inset-bottom)))] z-50 max-w-[90vw] px-4 py-2.5 rounded-2xl text-sm shadow-lg border ${
+            toast.kind === 'error'
+              ? 'bg-rose-950/95 text-rose-100 border-rose-500/40'
+              : 'bg-emerald-950/95 text-emerald-100 border-emerald-500/40'
+          }`}
+        >
+          {toast.text}
+        </div>
+      )}
     </div>
   );
 };

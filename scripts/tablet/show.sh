@@ -18,8 +18,21 @@ if [[ -s "$DATA/tunnel_url.txt" ]]; then
   url="$(tr -d '[:space:]' < "$DATA/tunnel_url.txt")"
 fi
 token=""
+gallery_env=""
 if [[ -f "$ENV_FILE" ]]; then
   token="$(grep -m1 '^AGENT_TOKEN=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- || true)"
+  gallery_env="$(grep -m1 '^GALLERY_DIR=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- || true)"
+fi
+
+gallery=""
+if [[ -n "$gallery_env" ]]; then
+  gallery="$gallery_env"
+elif [[ -d "$HOME/storage/movies" ]]; then
+  gallery="$HOME/storage/movies/GrokPC"
+elif [[ -d /sdcard/Movies || -w /sdcard/Movies ]]; then
+  gallery="/sdcard/Movies/GrokPC"
+else
+  gallery="(nahi mili — termux-setup-storage chalao)"
 fi
 
 echo "======= GrokPC (tablet) ======="
@@ -27,5 +40,6 @@ echo "Backend URL : ${url:-not ready — start.sh chalao / logs dekho}"
 echo "AGENT_TOKEN : ${token:-missing — install.sh chalao}"
 echo "Env file    : $ENV_FILE"
 echo "Logs        : $DATA/logs"
+echo "Gallery     : $gallery"
 echo "=============================="
 echo "App Settings → Tablet me URL + token paste karo, phir Home pe worker 'Tablet' chuno."

@@ -7,6 +7,7 @@ Phase 2 features are flag-gated and default OFF.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 import json
 import logging
 import time
@@ -16,6 +17,7 @@ from typing import Any, Optional
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from starlette.websockets import WebSocket, WebSocketDisconnect
@@ -451,6 +453,39 @@ async def api_job_logs(job_id: str, limit: int = 200, _auth: str = Depends(requi
     if not get_job(job_id):
         raise HTTPException(status_code=404, detail="Unknown job")
     return {"logs": list_logs(job_id, limit=limit)}
+
+
+def _job_video_file(job: dict[str, Any]) -> Path | None:
+    for key in ("final_path", "video_path"):
+        raw = (job.get(key) or "").strip()
+        if not raw:
+            continue
+        path = Path(raw)
+        if path.is_file():
+            return path
+    return None
+
+
+def _download_filename(job_id: str) -> str:
+    safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in job_id)[:80] or "job"
+    return f"GrokPC_{safe}.mp4"
+
+
+@app.get("/api/jobs/{job_id}/download")
+async def api_download_job(job_id: str, _auth: str = Depends(require_auth)):
+    """Return the job's final video as an attachment. Auth: Bearer or ?token=."""
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Unknown job")
+    path = _job_video_file(job)
+    if not path:
+        raise HTTPException(status_code=404, detail="Video file missing")
+    return FileResponse(
+        path,
+        media_type="video/mp4",
+        filename=_download_filename(job_id),
+        content_disposition_type="attachment",
+    )
 
 
 @app.post("/api/jobs/{job_id}/pause")

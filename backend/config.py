@@ -168,6 +168,9 @@ WINDOWS_HELPER_TOKEN = os.getenv("WINDOWS_HELPER_TOKEN", "").strip() or AGENT_TO
 WINDOWS_HELPER_PORT = int(os.getenv("WINDOWS_HELPER_PORT", "8765"))
 # Folder on the Windows drive so CapCut can see media. Empty = auto-detect /mnt/c/Users/*/Videos/GrokPC
 WINDOWS_MEDIA_DIR = os.getenv("WINDOWS_MEDIA_DIR", "").strip()
+# Tablet gallery folder for a copy of the finished mp4. Empty = auto-detect
+# ~/storage/movies/GrokPC (termux-setup-storage) or /sdcard/Movies/GrokPC.
+GALLERY_DIR = os.getenv("GALLERY_DIR", "").strip()
 
 # Autopilot knobs (only consulted when FEATURE_AUTOPILOT=1).
 AUTOPILOT_ENABLED = _bool("AUTOPILOT_ENABLED", False)
@@ -248,27 +251,69 @@ def output_dir() -> Path:
     return path
 
 
+def _writable_dir(path: Path) -> bool:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / ".grokpc_write_test"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        return True
+    except OSError:
+        return False
+
+
+def _detect_windows_media_dir() -> Path | None:
+    """WINDOWS_MEDIA_DIR or /mnt/c/Users/*/Videos/GrokPC, else None (no output_dir fallback)."""
+    if WINDOWS_MEDIA_DIR:
+        path = Path(WINDOWS_MEDIA_DIR).expanduser()
+        return path if _writable_dir(path) else None
+    users = Path("/mnt/c/Users")
+    if not users.is_dir():
+        return None
+    skip = {"public", "default", "default user", "all users", "desktop.ini"}
+    for user in sorted(users.iterdir()):
+        if not user.is_dir() or user.name.lower() in skip or user.name.startswith("."):
+            continue
+        videos = user / "Videos"
+        path = (videos if videos.is_dir() else user) / "GrokPC"
+        if _writable_dir(path):
+            return path
+    return None
+
+
 def windows_media_dir() -> Path:
     """A Windows-visible folder for CapCut imports. Falls back to output_dir()."""
-    if WINDOWS_MEDIA_DIR:
-        path = Path(WINDOWS_MEDIA_DIR)
-        path.mkdir(parents=True, exist_ok=True)
-        return path
-    users = Path("/mnt/c/Users")
-    if users.is_dir():
-        skip = {"public", "default", "default user", "all users", "desktop.ini"}
-        for user in sorted(users.iterdir()):
-            if not user.is_dir() or user.name.lower() in skip or user.name.startswith("."):
-                continue
-            videos = user / "Videos"
-            if videos.is_dir() or user.is_dir():
-                path = (videos if videos.is_dir() else user) / "GrokPC"
-                try:
-                    path.mkdir(parents=True, exist_ok=True)
-                    return path
-                except OSError:
-                    continue
-    return output_dir()
+    return _detect_windows_media_dir() or output_dir()
+
+
+def windows_final_dir() -> Path | None:
+    """Where finished laptop videos are copied (Videos/GrokPC). None if not on WSL/Windows."""
+    if ANDROID:
+        return None
+    return _detect_windows_media_dir()
+
+
+def gallery_dir() -> Path | None:
+    """Writable Android/Termux gallery folder, or None if storage is not set up."""
+    candidates: list[Path] = []
+    if GALLERY_DIR:
+        candidates.append(Path(GALLERY_DIR).expanduser())
+    movies = Path.home() / "storage" / "movies"
+    if movies.is_dir():
+        candidates.append(movies / "GrokPC")
+    candidates.append(Path("/sdcard/Movies/GrokPC"))
+    seen: set[Path] = set()
+    for path in candidates:
+        try:
+            key = path.resolve() if path.exists() else path
+        except OSError:
+            key = path
+        if key in seen:
+            continue
+        seen.add(key)
+        if _writable_dir(path):
+            return path
+    return None
 
 
 def require_token() -> str:

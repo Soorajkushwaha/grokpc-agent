@@ -30,6 +30,7 @@ from config import (
 )
 from channels import get_channel
 from editors import edit_video
+from media_export import copy_final_video
 from jobs import (
     append_log,
     cancel_job,
@@ -285,11 +286,15 @@ class PipelineRunner:
                 )
                 final_path = Path(edited["video_path"])
                 update_job(job_id, video_path=str(final_path), final_path=str(final_path))
+                exports = copy_final_video(final_path, job_id)
                 detail = edited.get("editor") or "ffmpeg"
                 if edited.get("capcut"):
                     detail += f" capcut={edited['capcut'].get('status')}"
+                if exports:
+                    detail += f" saved={exports[0]}"
                 set_step(job_id, "edit", "success", detail)
-                await self._emit(job_id, "Edit", str(final_path), step="edit")
+                extra = f" also {exports[0]}" if exports else ""
+                await self._emit(job_id, "Edit", str(final_path) + extra, step="edit")
 
             elif name == "upload":
                 if not FEATURE_YOUTUBE_UPLOAD:
@@ -329,5 +334,7 @@ class PipelineRunner:
             else:
                 set_step(job_id, name, "skipped", "unknown step")
 
+        if final_path and Path(final_path).is_file():
+            copy_final_video(final_path, job_id)
         await self._emit(job_id, "Pipeline", "Complete", step="edit")
         return update_job(job_id, status="completed")

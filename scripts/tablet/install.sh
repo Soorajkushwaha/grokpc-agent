@@ -120,6 +120,20 @@ fi
 mkdir -p "$DATA/outputs" "$DATA/chrome_profile" "$LOG"
 ENV_FILE="$DEST/backend/.env"
 
+# Gallery access so finished videos can be copied to Movies/GrokPC.
+# Non-blocking: the Android permission popup may appear; install continues either way.
+if command -v termux-setup-storage >/dev/null 2>&1; then
+  if [[ -d "$HOME/storage/movies" || -d "$HOME/storage/shared" ]]; then
+    say "Gallery already ready: $HOME/storage/movies"
+  else
+    say "termux-setup-storage chalaya — permission popup aa sakta hai. Allow dabana."
+    say "Agar popup miss ho jaye, baad mein khud 'termux-setup-storage' chalao."
+    termux-setup-storage >/dev/null 2>&1 &
+  fi
+else
+  say "termux-setup-storage nahi mila — videos gallery me save karne ke liye baad mein chalao."
+fi
+
 say "[2/6] Repo clone / update..."
 if [[ -f "$DEST/backend/main.py" ]]; then
   if [[ -d "$DEST/.git" ]]; then
@@ -324,6 +338,7 @@ say "  2. Termux notification ko dismiss mat karo (foreground rakho)."
 say "  3. Recents me Termux ko lock karo. Tablet charge pe rakho."
 say "  4. Termux:Boot app ek baar kholo (pehli baar zaroori)."
 say "  5. Quick tunnel reboot ke baad badal sakti hai — naya URL show.sh se lo."
+say "  6. Videos gallery (Movies/GrokPC) me save hon: ek baar 'termux-setup-storage' chalao, Allow dabao."
 say "================================================================"
 say "Is worker pe Grok Imagine / Google Vids nahi chalte. Story Gemini/DeepSeek,"
 say "awaz Gemini TTS (ya edge-tts / gTTS fallback), visuals Pollinations stills"
