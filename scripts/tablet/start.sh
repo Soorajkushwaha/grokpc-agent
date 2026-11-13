@@ -18,6 +18,13 @@ DATA="${GROKPC_DATA:-$HOME/grokpc-data}"
 LOG="$DATA/logs"
 ENV_FILE="${GROKPC_ENV:-$ROOT/backend/.env}"
 VENV="${GROKPC_VENV:-$DATA/venv}"
+
+# /api/health needs the token; any HTTP answer (200/401/403) means the agent is up.
+agent_up() {
+  local code
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time "${1:-2}" "http://127.0.0.1:${PORT}/api/health" 2>/dev/null || true)"
+  [[ "$code" =~ ^(200|401|403)$ ]]
+}
 mkdir -p "$LOG" "$DATA/outputs" "$DATA/chrome_profile"
 
 if command -v termux-wake-lock >/dev/null 2>&1; then
@@ -50,7 +57,7 @@ watchdog_alive() {
 }
 
 start_agent() {
-  if curl -sf --max-time 2 "http://127.0.0.1:${PORT}/api/health" >/dev/null 2>&1; then
+  if agent_up 2; then
     return 0
   fi
   if [[ ! -x "$VENV/bin/python" ]]; then
@@ -66,7 +73,7 @@ start_agent() {
   )
   # Give uvicorn a moment to bind.
   for _try in $(seq 1 20); do
-    curl -sf --max-time 1 "http://127.0.0.1:${PORT}/api/health" >/dev/null 2>&1 && return 0
+    agent_up 1 && return 0
     sleep 1
   done
   echo "[grokpc] agent not healthy yet — see $LOG/agent.log" >&2
@@ -117,7 +124,7 @@ echo "$$" > "$WATCHDOG_PIDFILE"
 echo "[grokpc] watchdog starting (ctrl+c to stop this loop only)"
 ensure
 while true; do
-  if ! curl -sf --max-time 2 "http://127.0.0.1:${PORT}/api/health" >/dev/null 2>&1; then
+  if ! agent_up 2; then
     echo "[grokpc] agent down — restart"
     start_agent || true
   fi
