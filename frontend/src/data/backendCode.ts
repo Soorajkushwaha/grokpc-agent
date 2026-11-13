@@ -856,6 +856,7 @@ class JobIn(BaseModel):
     topic: str
     idea: str = ""
     autopilot: bool = False
+    target_minutes: Optional[float] = None
 
 
 @app.get("/api/jobs")
@@ -891,6 +892,7 @@ async def api_create_job(req: JobIn, _auth: str = Depends(require_auth)):
         topic=topic,
         idea=req.idea.strip(),
         autopilot=req.autopilot,
+        target_minutes=req.target_minutes,
     )
     await broadcast(
         {
@@ -2297,12 +2299,25 @@ class PipelineRunner:
                     channel,
                     agent=self.agent,
                     log=self.broadcast,
+                    target_minutes=job.get("target_minutes"),
                 )
                 plan = result.get("plan") or {}
                 update_job(job_id, plan_json=plan, provider=result.get("planner") or "")
                 note = result.get("note") or result.get("planner") or "ok"
-                set_step(job_id, "story", "success", f"{result.get('planner')}: {plan.get('title') or ''} {note}"[:500])
-                await self._emit(job_id, "Story", plan.get("title") or "planned", step="story")
+                tgt = result.get("target") or (plan.get("target") if isinstance(plan, dict) else {}) or {}
+                wc = (plan.get("word_count") if isinstance(plan, dict) else None) or 0
+                nsc = len((plan.get("scenes") or []) if isinstance(plan, dict) else [])
+                detail = (
+                    f"{result.get('planner')}: {plan.get('title') or ''} {note} "
+                    f"[{nsc} scenes, {wc or '?'} words, target {tgt.get('minutes') or '?'} min]"
+                )
+                set_step(job_id, "story", "success", detail[:500])
+                await self._emit(
+                    job_id,
+                    "Story",
+                    f"{plan.get('title') or 'planned'} — {nsc} scenes, {wc or 'n/a'} words",
+                    step="story",
+                )
 
             elif name == "voiceover":
                 script = (plan or {}).get("voiceover_script") or job["topic"]
@@ -2332,8 +2347,11 @@ class PipelineRunner:
                         dest = alt
                 voice_path = dest
                 update_job(job_id, voice_path=str(dest))
-                set_step(job_id, "voiceover", "success", f"engine={engine}")
-                await self._emit(job_id, "Voiceover", f"{engine} -> {dest.name}", step="voiceover")
+                detail = f"engine={engine}"
+                if "quota" in str(engine).lower():
+                    detail += " — Gemini free-tier quota; awaaz fallback pe hai"
+                set_step(job_id, "voiceover", "success", detail[:500])
+                await self._emit(job_id, "Voiceover", f"voice: {engine} -> {dest.name}", step="voiceover")
 
             elif name in {"visuals", "generate"}:
                 # "visuals" is the current step name; "generate" is kept for older jobs.
@@ -2514,6 +2532,8 @@ TTS_RATE=-8%
 TTS_PITCH=-8Hz
 # Optional: pad each scene narration to at least this many seconds (0 = follow speech).
 TARGET_SCENE_SEC=0
+# Optional default duration in minutes (0 = auto-detect from the prompt).
+# TARGET_MINUTES=0
 GEMINI_VISION_MODEL=gemini-3.8-flash
 # Free-tier Gemini text planner (default). Leave GEMINI_API_KEY empty until you add a key.
 GEMINI_TEXT_MODEL=gemini-3.8-flash
@@ -2575,7 +2595,7 @@ FEATURE_GOOGLE_VIDS=0
 # Max browser clips per job (Grok only, if enabled). Image scenes use MAX_IMAGE_SCENES.
 MAX_CLIPS_PER_JOB=4
 CLIP_TIMEOUT_SEC=240
-MAX_IMAGE_SCENES=10
+MAX_IMAGE_SCENES=120
 
 # --- Still Phase 2 (default OFF — do not turn on until tested on the laptop) ---
 FEATURE_VEO=0
