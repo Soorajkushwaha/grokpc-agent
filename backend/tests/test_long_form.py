@@ -44,8 +44,11 @@ from duration_target import (  # noqa: E402
     plan_schema_hint,
     scene_budget,
     word_count,
+    words_for_minutes,
+    WORDS_PER_MIN,
 )
 from gemini_tts import (  # noqa: E402
+    _as_dict,
     backoff_seconds,
     chunk_text,
     classify_gemini_error,
@@ -53,6 +56,10 @@ from gemini_tts import (  # noqa: E402
     extract_audio_from_response,
     is_speechconfig_400,
     speechconfig_bodies,
+)
+from voiceover import (  # noqa: E402
+    scale_cues,
+    tempo_to_fit,
 )
 from longform import (  # noqa: E402
     coalesce_scenes,
@@ -190,7 +197,10 @@ def test_detect_short_and_explicit() -> None:
     e = detect_duration_target("ek chhoti kahani", "", target_minutes=3)
     check("explicit 3 min", e.minutes == 3 and e.source == "explicit" and e.is_long, str(e))
     check("3 min ~12 scenes", 9 <= e.scene_count <= 23, str(e.scene_count))
-    check("3 min words ~400", 300 <= e.word_min <= 500, str(e.word_min))
+    check("3 min words ~300-400 (115 wpm)", 280 <= e.word_min <= 420, str(e.word_min))
+    # Slow Hindi edge-tts (~110 wpm) at word_max must still fit in 225s.
+    spoken_slow = e.word_max / 110 * 60
+    check("3 min word_max at 110wpm <= 225s", spoken_slow <= 225, str((e.word_max, spoken_slow)))
     # ±25% of 180s is the job's duration tolerance — scene budget should cover it.
     span = e.scene_count * e.scene_sec
     check("3 min scene budget near 180s", 135 <= span <= 240, str((e.scene_count, e.scene_sec, span)))
@@ -507,6 +517,78 @@ def test_jobs_api_target_minutes() -> None:
         client.post(f"/api/jobs/{jid}/cancel", headers=AUTH)
 
 
+
+def test_word_budget_and_tempo() -> None:
+    print("== word budget + atempo fit ==")
+    check("WORDS_PER_MIN conservative", 100 <= WORDS_PER_MIN <= 120, str(WORDS_PER_MIN))
+    lo, hi = words_for_minutes(3)
+    check("3min mid around 345", 300 <= ((lo + hi) / 2) <= 400, str((lo, hi)))
+    slow = hi / 110 * 60
+    check("word_max at 110wpm inside 225s", slow <= 225, str((hi, slow)))
+    # This is the actual 3-min verification job: 476 words / 257.5s at the old 140 wpm budget.
+    # New budget must not request that many words.
+    check("new 3min word_max < 476", hi < 476, str(hi))
+    t = tempo_to_fit(200, 180)
+    check("200s in 135-225 window: no tempo", t == 1.0, str(t))
+    t = tempo_to_fit(257.52, 180)
+    check("257s needs ~1.144", 1.14 <= t <= 1.15, str(t))
+    check("257s after tempo <= 225", 257.52 / t <= 225.01, str(257.52 / t))
+    t = tempo_to_fit(400, 180)
+    check("huge overshoot capped at 1.15", abs(t - 1.15) < 1e-9, str(t))
+    t = tempo_to_fit(100, 180)
+    check("short audio not sped up", t == 1.0, str(t))
+    t = tempo_to_fit(0, 180)
+    check("zero duration safe", t == 1.0, str(t))
+    cues = [
+        {"start": 0.0, "end": 22.752, "text": "a", "engine": "edge-tts"},
+        {"start": 23.202, "end": 45.954, "text": "b", "engine": "edge-tts"},
+    ]
+    sc = scale_cues(cues, 1.15)
+    check("cue engine preserved", sc[0]["engine"] == "edge-tts" and sc[0]["text"] == "a", str(sc))
+    check("cue end scaled", abs(sc[0]["end"] - 22.752 / 1.15) < 0.01, str(sc[0]))
+    check("original cues not mutated", cues[0]["end"] == 22.752, str(cues[0]))
+    check("tempo 1 keeps times", scale_cues(cues, 1.0)[1]["end"] == 45.954, str(scale_cues(cues, 1.0)))
+
+
+def test_as_dict_skips_async_json() -> None:
+    print("== _as_dict does not await async json ==")
+    import gc
+    import warnings
+
+    class FakeCoroResp:
+        def json(self):
+            async def _coro():
+                return {"error": {"message": "should not be read via coro"}}
+            return _coro()
+
+        @property
+        def text(self):
+            return '{"error":{"message":"You exceeded your current quota"}}'
+
+    class FakeAsyncDefResp:
+        async def json(self):
+            return {"error": {"message": "async def json"}}
+
+        @property
+        def text(self):
+            return '{"error":{"message":"You exceeded your current quota"}}'
+
+    class FakeExc(Exception):
+        def __init__(self, resp):
+            self.response = resp
+            super().__init__("GenerateContentPerDay quota exceeded")
+
+    for label, resp in (("returns-coro", FakeCoroResp()), ("async-def", FakeAsyncDefResp())):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            data = _as_dict(FakeExc(resp))
+            gc.collect()
+            never = [str(w.message) for w in caught if "never awaited" in str(w.message).lower()]
+        check(f"{label} no unawaited warning", not never, str(never))
+        blob = str(data).lower()
+        check(f"{label} still has quota text", "quota" in blob, blob[:200])
+
+
 def main() -> int:
     test_detect_user_30min()
     test_detect_short_and_explicit()
@@ -516,6 +598,8 @@ def main() -> int:
     test_image_reuse()
     test_cascaded_tts_per_chunk()
     test_jobs_api_target_minutes()
+    test_word_budget_and_tempo()
+    test_as_dict_skips_async_json()
     print()
     if failed:
         print(f"{failed} FAILED")

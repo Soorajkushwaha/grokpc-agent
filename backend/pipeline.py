@@ -217,8 +217,24 @@ class PipelineRunner:
                     if TARGET_SCENE_SEC and min_sec < TARGET_SCENE_SEC:
                         min_sec = float(TARGET_SCENE_SEC)
                     segments.append({"text": narr, "min_sec": min_sec})
+                target_sec = 0.0
+                try:
+                    tm = job.get("target_minutes")
+                    if tm:
+                        target_sec = float(tm) * 60.0
+                except (TypeError, ValueError):
+                    target_sec = 0.0
+                if not target_sec and isinstance(plan, dict):
+                    tgt = plan.get("target") or {}
+                    if isinstance(tgt, dict) and tgt.get("minutes"):
+                        try:
+                            target_sec = float(tgt["minutes"]) * 60.0
+                        except (TypeError, ValueError):
+                            target_sec = 0.0
                 engine = await synthesize_voice_safe(
-                    script, lang, dest, log=self.broadcast, segments=segments or None
+                    script, lang, dest, log=self.broadcast,
+                    segments=segments or None,
+                    target_seconds=target_sec or None,
                 )
                 # synthesize may write .wav if mp3 encode failed
                 if not dest.is_file():

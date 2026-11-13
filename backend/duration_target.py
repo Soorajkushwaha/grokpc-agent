@@ -11,9 +11,12 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-# Hindi narration is typically ~130–150 words per minute at a slow
-# storyteller pace. The user's 30-minute brief asked for 3,800–4,500 words.
-WORDS_PER_MIN = 140
+# Measured Hindi edge-tts at a slow storyteller pace is ~111 words/min
+# (job-b96e8a9b1e04: 476 words in 257.5s). Charon is typically a bit
+# faster. 115 wpm is a conservative budget so a 3-minute target stays
+# inside 135–225s even when speech is slow. A brief can still override
+# with an explicit word count (the 30-minute prompt asked for 3,800–4,500).
+WORDS_PER_MIN = 115
 # One cinematic still / Ken Burns beat every 8–20 seconds.
 SCENE_SEC_MIN = 8
 SCENE_SEC_MAX = 20
@@ -323,7 +326,7 @@ def detect_duration_target(
     notes.extend(wnotes)
     if wlo is None:
         wlo, whi = words_for_minutes(minutes)
-        # Historic short-form scripts are shorter than 140 wpm * 1 minute.
+        # Historic short-form scripts are shorter than WORDS_PER_MIN * 1 minute.
         if source == "default" and minutes <= 1.25:
             wlo, whi = 60, 160
 

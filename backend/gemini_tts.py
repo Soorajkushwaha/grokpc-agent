@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import json
 import logging
 import random
@@ -100,18 +101,44 @@ def _as_dict(obj: Any) -> dict[str, Any]:
         resp = getattr(obj, attr, None)
         if resp is None:
             continue
+        # httpx.Response.json() is sync; aiohttp's is a coroutine. Never
+        # call an async json() from this sync helper — that leaked
+        # "coroutine ClientResponse.json was never awaited" on the laptop.
         try:
-            if hasattr(resp, "json"):
-                data = resp.json()
-                if callable(data):
+            json_fn = getattr(resp, "json", None)
+            if callable(json_fn) and not inspect.iscoroutinefunction(json_fn):
+                data = json_fn()
+                if inspect.isawaitable(data):
+                    try:
+                        data.close()
+                    except Exception:
+                        pass
+                elif callable(data) and not inspect.iscoroutinefunction(data):
                     data = data()
-                if isinstance(data, dict):
+                    if inspect.isawaitable(data):
+                        try:
+                            data.close()
+                        except Exception:
+                            pass
+                    elif isinstance(data, dict):
+                        return data
+                elif isinstance(data, dict):
                     return data
         except Exception:
             pass
         try:
             text = getattr(resp, "text", None)
-            if text:
+            if callable(text) and not inspect.iscoroutinefunction(text):
+                text = text()
+                if inspect.isawaitable(text):
+                    try:
+                        text.close()
+                    except Exception:
+                        pass
+                    text = None
+            if isinstance(text, (bytes, bytearray)):
+                return _as_dict(text)
+            if isinstance(text, str) and text:
                 return _as_dict(text)
         except Exception:
             pass

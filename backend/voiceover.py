@@ -37,6 +37,12 @@ DEFAULT_EDGE_RATE = "-8%"
 DEFAULT_EDGE_PITCH = "-8Hz"
 DEFAULT_PAUSE_SEC = 0.45
 PCM_RATE = 24000
+# If spoken audio overshoots the requested duration by more than 25%,
+# speed it up slightly (capped at 1.15x) so a 3-minute job stays in 135–225s.
+# Larger overshoots still get the cap — we would rather run a bit long than
+# sound rushed. The planner word budget is the primary lever.
+DURATION_TOLERANCE = 0.25
+MAX_ATEMPO = 1.15
 
 
 async def _emit(log: Optional[LogFn], typ: str, title: str, message: str) -> None:
@@ -884,6 +890,79 @@ async def _try_gtts(
     return wav, cues, dur, "gtts"
 
 
+
+def tempo_to_fit(
+    duration: float,
+    target_sec: float,
+    *,
+    tolerance: float = DURATION_TOLERANCE,
+    max_tempo: float = MAX_ATEMPO,
+) -> float:
+    """Return an atempo factor (>= 1). 1.0 means no change."""
+    try:
+        duration = float(duration)
+        target_sec = float(target_sec)
+    except (TypeError, ValueError):
+        return 1.0
+    if duration <= 0 or target_sec <= 0:
+        return 1.0
+    max_ok = target_sec * (1.0 + max(0.0, float(tolerance)))
+    if duration <= max_ok or max_ok <= 0:
+        return 1.0
+    needed = duration / max_ok
+    return min(float(max_tempo), needed)
+
+
+def scale_cues(cues: list[dict[str, Any]], tempo: float) -> list[dict[str, Any]]:
+    """Scale cue start/end times after an atempo speed-up."""
+    if not cues or not tempo or tempo == 1.0:
+        return [dict(c) for c in (cues or [])]
+    out: list[dict[str, Any]] = []
+    for c in cues:
+        nc = dict(c)
+        for key in ("start", "end"):
+            if key in nc and nc[key] is not None:
+                try:
+                    nc[key] = round(float(nc[key]) / tempo, 3)
+                except (TypeError, ValueError):
+                    pass
+        out.append(nc)
+    return out
+
+
+async def fit_voice_to_target(
+    wav: Path,
+    cues: list[dict[str, Any]],
+    duration: float,
+    target_sec: float,
+    *,
+    log: Optional[LogFn] = None,
+    tolerance: float = DURATION_TOLERANCE,
+    max_tempo: float = MAX_ATEMPO,
+) -> tuple[Path, list[dict[str, Any]], float, str]:
+    """If narration is longer than target*(1+tolerance), apply atempo (capped)."""
+    tempo = tempo_to_fit(duration, target_sec, tolerance=tolerance, max_tempo=max_tempo)
+    if tempo <= 1.01:
+        return Path(wav), cues, float(duration), ""
+    dest = Path(wav).with_name(Path(wav).stem + "_fit" + Path(wav).suffix)
+    code, err = await _ffmpeg([
+        "ffmpeg", "-y", "-i", str(wav),
+        "-filter:a", f"atempo={tempo:.4f}",
+        "-vn", str(dest),
+    ])
+    if code != 0 or not dest.is_file() or dest.stat().st_size < 200:
+        logger.warning("atempo fit failed (tempo=%.3f): %s", tempo, err)
+        return Path(wav), cues, float(duration), ""
+    new_dur = await media_duration(dest) or (float(duration) / tempo)
+    new_cues = scale_cues(cues, tempo)
+    note = (
+        f"atempo {tempo:.3f}x to fit {target_sec:g}s target "
+        f"({duration:.1f}s → {new_dur:.1f}s)"
+    )
+    await _emit(log, "system", "Voice fit", note)
+    return dest, new_cues, float(new_dur), note
+
+
 async def synthesize_voice(
     script: str,
     lang: str,
@@ -891,12 +970,15 @@ async def synthesize_voice(
     log: Optional[LogFn] = None,
     *,
     segments: Optional[list[Any]] = None,
+    target_seconds: Optional[float] = None,
 ) -> str:
     """Synthesize `script` (or pre-split `segments`) into `dest`. Returns engine id.
 
     Also writes a sibling `.cues.json` with sentence timings.
     """
-    result = await synthesize_voice_full(script, lang, dest, log=log, segments=segments)
+    result = await synthesize_voice_full(
+        script, lang, dest, log=log, segments=segments, target_seconds=target_seconds,
+    )
     return result.engine
 
 
@@ -907,6 +989,7 @@ async def synthesize_voice_full(
     log: Optional[LogFn] = None,
     *,
     segments: Optional[list[Any]] = None,
+    target_seconds: Optional[float] = None,
 ) -> VoiceResult:
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -930,6 +1013,12 @@ async def synthesize_voice_full(
         wav, cues, dur, engine, note = await _synth_cascaded(
             segs, work, lang, log, use_gemini=bool(use_gemini and gemini_key),
         )
+        if target_seconds:
+            wav, cues, dur, fit_note = await fit_voice_to_target(
+                wav, cues, dur, float(target_seconds), log=log,
+            )
+            if fit_note:
+                note = (note + " | " if note else "") + fit_note
         out = await _encode_dest(wav, dest)
         save_cues(out, cues)
         if Path(out) != dest:
@@ -958,6 +1047,7 @@ async def synthesize_voice_safe(
     log: Optional[LogFn] = None,
     *,
     segments: Optional[list[Any]] = None,
+    target_seconds: Optional[float] = None,
 ) -> str:
     """Pipeline entry: DRY_RUN silent audio, else the full fallback chain, else silence."""
     dest = Path(dest)
@@ -991,7 +1081,9 @@ async def synthesize_voice_safe(
         return "dry_run"
 
     try:
-        result = await synthesize_voice_full(script, lang, dest, log=log, segments=segments)
+        result = await synthesize_voice_full(
+            script, lang, dest, log=log, segments=segments, target_seconds=target_seconds,
+        )
         return result.engine
     except Exception as exc:
         logger.warning("Voiceover failed (%s); writing silent audio", exc)
